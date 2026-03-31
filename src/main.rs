@@ -47,7 +47,11 @@ enum Commands {
         #[arg(long, default_value_t = DEFAULT_BLOCK_SIZE)]
         block_size: usize,
 
-        /// Pre-shared key (hex encoded, 32 bytes). For testing only.
+        /// Number of blocks to send in parallel (interleaved)
+        #[arg(long, default_value = "4")]
+        interleave: usize,
+
+        /// Pre-shared key (hex encoded, 32 bytes)
         #[arg(long, default_value = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")]
         key: String,
 
@@ -73,11 +77,15 @@ enum Commands {
         #[arg(short, long)]
         size: u64,
 
+        /// Target rate in Mbps (for receiver rate calculator)
+        #[arg(short, long, default_value = "1000")]
+        rate: u64,
+
         /// Block size in bytes (must match sender)
         #[arg(long, default_value_t = DEFAULT_BLOCK_SIZE)]
         block_size: usize,
 
-        /// Pre-shared key (hex encoded, 32 bytes). For testing only.
+        /// Pre-shared key (hex encoded, 32 bytes)
         #[arg(long, default_value = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")]
         key: String,
 
@@ -102,6 +110,10 @@ enum Commands {
         /// Block size in bytes
         #[arg(long, default_value_t = DEFAULT_BLOCK_SIZE)]
         block_size: usize,
+
+        /// Number of blocks to interleave
+        #[arg(long, default_value = "4")]
+        interleave: usize,
     },
 }
 
@@ -141,6 +153,7 @@ async fn main() -> Result<()> {
             mode,
             fec_ratio,
             block_size,
+            interleave,
             key,
             session: _,
         } => {
@@ -149,13 +162,14 @@ async fn main() -> Result<()> {
 
             let engine = SendEngine::new(rate, rate_mode)
                 .with_block_size(block_size)
-                .with_repair_ratio(fec_ratio);
+                .with_repair_ratio(fec_ratio)
+                .with_interleave(interleave);
 
             let result = engine.send_file(&file, to, &shared_key).await?;
 
             println!("\n--- Transfer Complete ---");
             println!("  File size:     {} bytes", result.file_size);
-            println!("  Bytes sent:    {} bytes (with FEC overhead)", result.total_bytes_sent);
+            println!("  Bytes sent:    {} bytes (with FEC)", result.total_bytes_sent);
             println!("  Packets sent:  {}", result.total_packets_sent);
             println!("  Time:          {:.2?}", result.elapsed);
             println!("  Rate:          {:.1} Mbps", result.rate_mbps);
@@ -171,6 +185,7 @@ async fn main() -> Result<()> {
             output,
             filename,
             size,
+            rate,
             block_size,
             key,
             session,
@@ -178,7 +193,9 @@ async fn main() -> Result<()> {
             let shared_key = parse_hex_key(&key)?;
             let total_blocks = ((size as usize + block_size - 1) / block_size) as u32;
 
-            let engine = RecvEngine::new(output).with_block_size(block_size);
+            let engine = RecvEngine::new(output)
+                .with_block_size(block_size)
+                .with_target_rate(rate);
 
             println!("Waiting for transfer...");
             println!("  Expecting: {} ({} bytes, {} blocks)", filename, size, total_blocks);
@@ -195,6 +212,8 @@ async fn main() -> Result<()> {
             println!("  Time:          {:.2?}", result.elapsed);
             println!("  Rate:          {:.1} Mbps", result.rate_mbps);
             println!("  BLAKE3 hash:   {}", hex::encode(result.blake3_hash));
+            println!("  Loss estimate: {:.2}%", result.final_loss_estimate * 100.0);
+            println!("  FEC ratio rec: {:.1}%", result.final_fec_ratio * 100.0);
         }
 
         Commands::Bench {
@@ -202,22 +221,30 @@ async fn main() -> Result<()> {
             rate,
             fec_ratio,
             block_size,
+            interleave,
         } => {
-            run_benchmark(size_mb, rate, fec_ratio, block_size).await?;
+            run_benchmark(size_mb, rate, fec_ratio, block_size, interleave).await?;
         }
     }
 
     Ok(())
 }
 
-async fn run_benchmark(size_mb: u64, rate_mbps: u64, fec_ratio: f32, block_size: usize) -> Result<()> {
+async fn run_benchmark(
+    size_mb: u64,
+    rate_mbps: u64,
+    fec_ratio: f32,
+    block_size: usize,
+    interleave: usize,
+) -> Result<()> {
     use std::time::Instant;
 
-    println!("=== updown benchmark ===");
+    println!("=== updown Phase 2 benchmark ===");
     println!("  Data size:     {} MB", size_mb);
     println!("  Target rate:   {} Mbps", rate_mbps);
     println!("  FEC ratio:     {:.0}%", fec_ratio * 100.0);
     println!("  Block size:    {} bytes", block_size);
+    println!("  Interleave:    {} blocks", interleave);
     println!();
 
     let file_size = size_mb * 1024 * 1024;
@@ -225,7 +252,6 @@ async fn run_benchmark(size_mb: u64, rate_mbps: u64, fec_ratio: f32, block_size:
     let shared_key = [42u8; 32];
     let session_id: u32 = rand::random();
 
-    // Create test data file
     let temp_dir = tempfile::tempdir()?;
     let test_file = temp_dir.path().join("test_data.bin");
     {
@@ -245,7 +271,6 @@ async fn run_benchmark(size_mb: u64, rate_mbps: u64, fec_ratio: f32, block_size:
     println!("  Source hash:   {}", source_hash.to_hex());
     println!();
 
-    // Start receiver
     let recv_addr: SocketAddr = "127.0.0.1:9876".parse()?;
     let output_dir = temp_dir.path().join("output");
     std::fs::create_dir_all(&output_dir)?;
@@ -253,7 +278,9 @@ async fn run_benchmark(size_mb: u64, rate_mbps: u64, fec_ratio: f32, block_size:
     let recv_key = shared_key;
     let recv_output = output_dir.clone();
     let recv_handle = tokio::spawn(async move {
-        let engine = RecvEngine::new(recv_output).with_block_size(block_size);
+        let engine = RecvEngine::new(recv_output)
+            .with_block_size(block_size)
+            .with_target_rate(rate_mbps);
         engine
             .receive_file(
                 recv_addr,
@@ -266,25 +293,22 @@ async fn run_benchmark(size_mb: u64, rate_mbps: u64, fec_ratio: f32, block_size:
             .await
     });
 
-    // Give receiver a moment to bind
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    // Start sender
     let start = Instant::now();
 
     let send_engine = SendEngine::new(rate_mbps, RateMode::Fixed)
         .with_block_size(block_size)
-        .with_repair_ratio(fec_ratio);
+        .with_repair_ratio(fec_ratio)
+        .with_interleave(interleave);
 
     let send_result = send_engine
         .send_file_with_session(&test_file, recv_addr, &shared_key, session_id)
         .await?;
 
-    // Wait for receiver
     let recv_result = recv_handle.await??;
     let total_elapsed = start.elapsed();
 
-    // Verify
     let hashes_match = send_result.file_hash == recv_result.blake3_hash;
 
     println!();
@@ -302,6 +326,9 @@ async fn run_benchmark(size_mb: u64, rate_mbps: u64, fec_ratio: f32, block_size:
         "  FEC overhead:    {:.1}%",
         ((send_result.total_bytes_sent as f64 / file_size as f64) - 1.0) * 100.0
     );
+    println!("  Excess symbols:  {}", recv_result.total_excess_symbols);
+    println!("  Loss estimate:   {:.2}%", recv_result.final_loss_estimate * 100.0);
+    println!("  Adaptive FEC:    {:.1}%", recv_result.final_fec_ratio * 100.0);
     println!(
         "  Integrity:       {}",
         if hashes_match { "PASS" } else { "FAIL" }

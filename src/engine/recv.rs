@@ -16,6 +16,7 @@ use crate::transport::receiver::UdpReceiver;
 pub struct RecvEngine {
     output_dir: PathBuf,
     block_size: usize,
+    target_rate_mbps: u64,
 }
 
 impl RecvEngine {
@@ -23,6 +24,7 @@ impl RecvEngine {
         Self {
             output_dir,
             block_size: DEFAULT_BLOCK_SIZE,
+            target_rate_mbps: 10_000,
         }
     }
 
@@ -31,8 +33,11 @@ impl RecvEngine {
         self
     }
 
-    /// Receive a file transfer.
-    /// For Phase 1, uses pre-shared key and expects metadata via CLI args.
+    pub fn with_target_rate(mut self, rate_mbps: u64) -> Self {
+        self.target_rate_mbps = rate_mbps;
+        self
+    }
+
     pub async fn receive_file(
         &self,
         bind_addr: SocketAddr,
@@ -44,37 +49,32 @@ impl RecvEngine {
     ) -> Result<RecvResult> {
         let start = Instant::now();
 
-        // Create output directory if needed
         fs::create_dir_all(&self.output_dir).await.ok();
-
         let output_path = self.output_dir.join(filename);
         info!("Receiving {} -> {}", filename, output_path.display());
 
-        // Create/truncate output file
         let mut file = File::create(&output_path)
             .await
             .context("failed to create output file")?;
 
-        // Pre-allocate file
+        // Pre-allocate file (FASP Fig 4 step 406: "allocate storage space")
         file.set_len(file_size).await?;
 
-        // Create crypto context
         let crypto = CryptoContext::from_key(shared_key)?;
 
-        // Create receiver
         let mut receiver = UdpReceiver::new(
             bind_addr,
             session_id,
             crypto,
             self.block_size as u64,
             total_blocks,
+            self.target_rate_mbps,
         )
         .await?;
 
         let actual_bind = receiver.local_addr()?;
         info!("Receiver listening on {}", actual_bind);
 
-        // Progress bar
         let pb = ProgressBar::new(file_size);
         pb.set_style(
             ProgressStyle::default_bar()
@@ -83,22 +83,17 @@ impl RecvEngine {
                 .progress_chars("=>-"),
         );
 
-        // Channel for completed blocks
-        let (block_tx, mut block_rx) = mpsc::channel(32);
+        let (block_tx, mut block_rx) = mpsc::channel(64);
 
-        // Spawn receiver loop
-        let recv_handle = tokio::spawn(async move {
-            receiver.receive_loop(block_tx).await
-        });
+        let recv_handle = tokio::spawn(async move { receiver.receive_loop(block_tx).await });
 
-        // Write completed blocks to file
         let mut blocks_written = 0u32;
         let mut bytes_written = 0u64;
+        let mut total_excess_symbols = 0u64;
 
         while let Some(block) = block_rx.recv().await {
             let offset = block.block_id as u64 * self.block_size as u64;
 
-            // Calculate actual data length for this block
             let actual_len = if block.block_id == total_blocks - 1 {
                 let remaining = file_size - offset;
                 remaining as usize
@@ -106,17 +101,20 @@ impl RecvEngine {
                 self.block_size
             };
 
-            // Write block data at correct offset
             file.seek(std::io::SeekFrom::Start(offset)).await?;
             file.write_all(&block.data[..actual_len]).await?;
 
             blocks_written += 1;
             bytes_written += actual_len as u64;
+            total_excess_symbols += block.decode_stats.excess_symbols as u64;
 
             pb.set_position(bytes_written);
             pb.set_message(format!(
-                "block {}/{} ({} pkts, {:?})",
-                blocks_written, total_blocks, block.packets_received, block.elapsed
+                "blk {}/{} excess={} loss={:.1}%",
+                blocks_written,
+                total_blocks,
+                block.decode_stats.excess_symbols,
+                block.decode_stats.estimated_loss * 100.0,
             ));
 
             if blocks_written >= total_blocks {
@@ -129,10 +127,8 @@ impl RecvEngine {
 
         pb.finish_with_message("transfer complete");
 
-        // Wait for receiver to finish
         let recv_stats = recv_handle.await??;
 
-        // Verify file hash
         let received_data = tokio::fs::read(&output_path).await?;
         let received_hash = blake3::hash(&received_data);
 
@@ -144,10 +140,13 @@ impl RecvEngine {
         };
 
         info!(
-            "Receive complete: {} bytes in {:?} ({:.1} Mbps)",
-            bytes_written, elapsed, rate_mbps
+            "Receive complete: {} bytes in {:?} ({:.1} Mbps), loss_est={:.2}%, fec_ratio={:.1}%",
+            bytes_written,
+            elapsed,
+            rate_mbps,
+            recv_stats.final_loss_estimate * 100.0,
+            recv_stats.final_fec_ratio * 100.0,
         );
-        info!("File hash: {}", received_hash.to_hex());
 
         Ok(RecvResult {
             output_path,
@@ -157,6 +156,9 @@ impl RecvEngine {
             elapsed,
             rate_mbps,
             blake3_hash: *received_hash.as_bytes(),
+            final_loss_estimate: recv_stats.final_loss_estimate,
+            final_fec_ratio: recv_stats.final_fec_ratio,
+            total_excess_symbols,
         })
     }
 }
@@ -170,4 +172,7 @@ pub struct RecvResult {
     pub elapsed: std::time::Duration,
     pub rate_mbps: f64,
     pub blake3_hash: [u8; 32],
+    pub final_loss_estimate: f32,
+    pub final_fec_ratio: f32,
+    pub total_excess_symbols: u64,
 }

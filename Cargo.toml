@@ -11,6 +11,9 @@ tokio = { version = "1", features = ["full"] }
 # UDP socket configuration
 socket2 = { version = "0.5", features = ["all"] }
 
+# High-performance UDP with GSO/GRO support
+quinn-udp = "0.5"
+
 # Fountain codes (FEC) - replaces ACK/retransmit
 raptorq = "2"
 
@@ -34,6 +37,9 @@ clap = { version = "4", features = ["derive"] }
 
 # Byte manipulation
 bytes = "1"
+
+# Lock-free data structures for buffer pools
+crossbeam-queue = "0.3"
 
 # Logging
 tracing = "0.1"

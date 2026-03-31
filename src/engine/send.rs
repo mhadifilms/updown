@@ -5,7 +5,6 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::fs::File;
-use tokio::io::AsyncReadExt;
 use tracing::info;
 
 use crate::crypto::CryptoContext;
@@ -13,11 +12,15 @@ use crate::protocol::*;
 use crate::transport::rate_control::RateMode;
 use crate::transport::sender::UdpSender;
 
+/// Default number of blocks to interleave (send in parallel)
+const DEFAULT_INTERLEAVE: usize = 4;
+
 pub struct SendEngine {
     target_rate_mbps: u64,
     rate_mode: RateMode,
     block_size: usize,
     repair_ratio: f32,
+    interleave_depth: usize,
 }
 
 impl SendEngine {
@@ -26,7 +29,8 @@ impl SendEngine {
             target_rate_mbps,
             rate_mode,
             block_size: DEFAULT_BLOCK_SIZE,
-            repair_ratio: 0.15, // 15% FEC overhead by default
+            repair_ratio: 0.15,
+            interleave_depth: DEFAULT_INTERLEAVE,
         }
     }
 
@@ -40,8 +44,11 @@ impl SendEngine {
         self
     }
 
-    /// Send a file to the receiver at the given address.
-    /// For Phase 1, this uses a pre-shared key (no QUIC control channel yet).
+    pub fn with_interleave(mut self, depth: usize) -> Self {
+        self.interleave_depth = depth.max(1);
+        self
+    }
+
     pub async fn send_file(
         &self,
         file_path: &Path,
@@ -61,7 +68,6 @@ impl SendEngine {
     ) -> Result<SendResult> {
         let start = Instant::now();
 
-        // Open and read file metadata
         let file = File::open(file_path)
             .await
             .context("failed to open file")?;
@@ -76,43 +82,30 @@ impl SendEngine {
         let total_blocks = ((file_size as usize + self.block_size - 1) / self.block_size) as u32;
 
         info!(
-            "Sending {} ({} bytes, {} blocks of {} bytes)",
-            filename, file_size, total_blocks, self.block_size
+            "Sending {} ({} bytes, {} blocks, interleave={})",
+            filename, file_size, total_blocks, self.interleave_depth
         );
 
-        // Compute file hash
         let file_hash = {
             let file_bytes = tokio::fs::read(file_path).await?;
             blake3::hash(&file_bytes)
         };
 
-        // Create crypto context from shared key
         let crypto = CryptoContext::from_key(shared_key)?;
 
-        // Create manifest
-        let manifest = TransferManifest {
-            session_id,
-            filename: filename.clone(),
-            file_size,
-            block_size: self.block_size,
-            total_blocks,
-            file_hash: *file_hash.as_bytes(),
-        };
-
-        // Bind sender to any available port
         let bind_addr: SocketAddr = "0.0.0.0:0".parse()?;
         let mut sender = UdpSender::new(
             bind_addr,
             receiver_addr,
-            manifest.session_id,
+            session_id,
             self.target_rate_mbps,
             self.rate_mode,
             crypto,
             self.repair_ratio,
+            self.interleave_depth,
         )
         .await?;
 
-        // Set up progress bar
         let pb = ProgressBar::new(file_size);
         pb.set_style(
             ProgressStyle::default_bar()
@@ -121,39 +114,46 @@ impl SendEngine {
                 .progress_chars("=>-"),
         );
 
-        // Send blocks
         let mut total_bytes_sent: u64 = 0;
         let mut total_packets_sent: u64 = 0;
-        let mut block_buf = vec![0u8; self.block_size];
 
-        // Re-open file for sequential reading
-        let mut file = File::open(file_path).await?;
+        // Read entire file into memory for interleaved sending
+        // (Phase 3 will use io_uring + O_DIRECT for streaming)
+        let file_data = tokio::fs::read(file_path).await?;
 
-        for block_id in 0..total_blocks {
-            // Read block from file
-            let bytes_remaining = file_size - (block_id as u64 * self.block_size as u64);
-            let this_block_size = (bytes_remaining as usize).min(self.block_size);
-            let buf = &mut block_buf[..this_block_size];
-            file.read_exact(buf).await?;
+        // Send blocks in interleaved groups
+        let mut block_id = 0u32;
+        while block_id < total_blocks {
+            // Collect a group of blocks for interleaved sending
+            let group_end = (block_id + self.interleave_depth as u32).min(total_blocks);
+            let mut block_group: Vec<(u32, &[u8])> = Vec::new();
 
-            // Send the block
-            let stats = sender.send_block(block_id, buf).await?;
+            for bid in block_id..group_end {
+                let offset = bid as usize * self.block_size;
+                let end = (offset + self.block_size).min(file_data.len());
+                block_group.push((bid, &file_data[offset..end]));
+            }
+
+            // Send the interleaved group
+            let stats = sender.send_blocks_interleaved(&block_group).await?;
 
             total_bytes_sent += stats.bytes_sent;
             total_packets_sent += stats.packets_sent;
 
-            pb.set_position((block_id as u64 + 1) * self.block_size as u64);
+            let progress_pos = (group_end as u64 * self.block_size as u64).min(file_size);
+            pb.set_position(progress_pos);
             pb.set_message(format!(
-                "block {}/{} @ {:.1} Mbps",
-                block_id + 1,
+                "blocks {}-{}/{} @ {:.0} Mbps",
+                block_id,
+                group_end - 1,
                 total_blocks,
                 stats.rate_mbps
             ));
+
+            block_id = group_end;
         }
 
-        // Send done signal
         sender.send_done().await?;
-
         pb.finish_with_message("transfer complete");
 
         let elapsed = start.elapsed();
@@ -164,7 +164,7 @@ impl SendEngine {
         };
 
         info!(
-            "Transfer complete: {} bytes in {:?} ({:.1} Mbps), {} packets sent",
+            "Transfer complete: {} bytes in {:?} ({:.1} Mbps), {} packets",
             file_size, elapsed, overall_rate_mbps, total_packets_sent
         );
 
