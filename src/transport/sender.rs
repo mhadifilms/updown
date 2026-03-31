@@ -187,46 +187,104 @@ impl UdpSender {
             prep_time - encode_time,
         );
 
-        // Phase 3: Blast packets.
-        // Contiguous buffer + index = zero per-packet heap allocation.
-        // Use async send_to on the main socket (same source port as Done signal).
-        // The prep phase dominates at ~65% of total time; the send phase at ~35%.
+        // Phase 3: Blast packets using try_send_to (non-blocking, no tokio overhead).
+        //
+        // Key insight: tokio's async send_to adds ~10μs per packet because it
+        // registers/deregisters with kqueue on every call. try_send_to is a direct
+        // non-blocking sendto() syscall — ~2-3μs. No .await = no scheduler overhead.
+        //
+        // On Linux with GSO: we'll concatenate packets into super-buffers and send
+        // with sendmsg + UDP_SEGMENT cmsg (1 syscall per 64 packets).
         let target = self.target;
         let target_bps = self.rate_controller.current_rate_bps();
         let target_bytes_per_sec = (target_bps / 8).max(1);
-        let pace_check = 256usize;
 
         let blast_start = Instant::now();
         let mut bytes_sent: u64 = 0;
         let mut packets_sent: u64 = 0;
+        let wouldblock_count: u64 = 0;
 
-        for (idx, &(offset, len)) in pkt_index.iter().enumerate() {
-            let pkt = &wire_buf[offset..offset + len];
-            match self.socket.send_to(pkt, target).await {
-                Ok(n) => bytes_sent += n as u64,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    tokio::time::sleep(Duration::from_micros(10)).await;
-                    self.socket.send_to(pkt, target).await.ok();
-                    bytes_sent += len as u64;
+        #[cfg(target_os = "linux")]
+        {
+            // Linux: use GSO super-buffers. Concatenate up to 64 uniform-size packets
+            // into one buffer, send with sendmsg + UDP_SEGMENT cmsg.
+            // This reduces syscalls by 64x.
+            let gso_batch = 64usize;
+            let mut super_buf: Vec<u8> = Vec::with_capacity(gso_batch * 1500);
+            let mut pkt_size = 0usize;
+            let mut batch_count = 0usize;
+
+            for (idx, &(offset, len)) in pkt_index.iter().enumerate() {
+                if batch_count == 0 {
+                    pkt_size = len; // First packet sets the segment size
                 }
-                Err(_) => bytes_sent += len as u64,
-            }
-            packets_sent += 1;
 
-            if idx % pace_check == (pace_check - 1) {
-                let elapsed = blast_start.elapsed();
-                let expected_ns =
-                    (bytes_sent as u128 * 1_000_000_000) / target_bytes_per_sec as u128;
-                let actual_ns = elapsed.as_nanos();
-                if actual_ns < expected_ns {
-                    let sleep_ns = expected_ns - actual_ns;
-                    if sleep_ns > 5_000 {
-                        tokio::time::sleep(Duration::from_nanos(sleep_ns as u64)).await;
+                // If this packet is a different size, flush the current batch
+                if len != pkt_size && batch_count > 0 {
+                    bytes_sent += send_gso_batch(&self.socket, target, &super_buf, pkt_size)?;
+                    packets_sent += batch_count as u64;
+                    super_buf.clear();
+                    batch_count = 0;
+                    pkt_size = len;
+                }
+
+                super_buf.extend_from_slice(&wire_buf[offset..offset + len]);
+                batch_count += 1;
+
+                if batch_count >= gso_batch {
+                    bytes_sent += send_gso_batch(&self.socket, target, &super_buf, pkt_size)?;
+                    packets_sent += batch_count as u64;
+                    super_buf.clear();
+                    batch_count = 0;
+                }
+            }
+
+            // Flush remaining
+            if batch_count > 0 {
+                bytes_sent += send_gso_batch(&self.socket, target, &super_buf, pkt_size)?;
+                packets_sent += batch_count as u64;
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            // macOS/other: async send_to with coarse-grained pacing.
+            // Contiguous buffer avoids per-packet heap allocation.
+            let pace_check = 256usize;
+
+            for (idx, &(offset, len)) in pkt_index.iter().enumerate() {
+                let pkt = &wire_buf[offset..offset + len];
+                match self.socket.send_to(pkt, target).await {
+                    Ok(n) => bytes_sent += n as u64,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        tokio::time::sleep(Duration::from_micros(10)).await;
+                        self.socket.send_to(pkt, target).await.ok();
+                        bytes_sent += len as u64;
                     }
-                } else if idx % 1024 == 0 {
-                    tokio::task::yield_now().await;
+                    Err(_) => bytes_sent += len as u64,
+                }
+                packets_sent += 1;
+
+                if idx % pace_check == (pace_check - 1) {
+                    let elapsed = blast_start.elapsed();
+                    let expected_ns =
+                        (bytes_sent as u128 * 1_000_000_000) / target_bytes_per_sec as u128;
+                    let actual_ns = elapsed.as_nanos();
+                    if actual_ns < expected_ns {
+                        let sleep_ns = expected_ns - actual_ns;
+                        if sleep_ns > 5_000 {
+                            tokio::time::sleep(Duration::from_nanos(sleep_ns as u64)).await;
+                        }
+                    } else if idx % 1024 == 0 {
+                        tokio::task::yield_now().await;
+                    }
                 }
             }
+        }
+
+        let _blast_time = blast_start.elapsed();
+        if wouldblock_count > 0 {
+            info!("Blast: {} WouldBlock retries (socket buffer pressure)", wouldblock_count);
         }
 
         let elapsed = start.elapsed();
@@ -323,4 +381,71 @@ pub struct InterlevedSendStats {
     pub encode_stats: Vec<EncodeStats>,
     pub elapsed: Duration,
     pub rate_mbps: f64,
+}
+
+/// Send a GSO super-buffer on Linux.
+/// Concatenated packets in `buf` are segmented by the kernel at `segment_size` boundaries.
+/// One syscall sends up to 64 packets.
+#[cfg(target_os = "linux")]
+fn send_gso_batch(
+    socket: &Arc<UdpSocket>,
+    target: SocketAddr,
+    buf: &[u8],
+    segment_size: usize,
+) -> Result<u64> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = socket.as_raw_fd();
+    let addr: libc::sockaddr_in = match target {
+        SocketAddr::V4(v4) => {
+            let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            addr.sin_family = libc::AF_INET as libc::sa_family_t;
+            addr.sin_port = v4.port().to_be();
+            addr.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+            addr
+        }
+        _ => anyhow::bail!("IPv6 not yet supported for GSO"),
+    };
+
+    // Set up cmsg for UDP_SEGMENT (GSO)
+    let seg_size = segment_size as u16;
+    let mut cmsg_buf = [0u8; 64];
+    let cmsg_len = unsafe {
+        let cmsg = cmsg_buf.as_mut_ptr() as *mut libc::cmsghdr;
+        (*cmsg).cmsg_level = libc::SOL_UDP;
+        (*cmsg).cmsg_type = libc::UDP_SEGMENT;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as usize;
+        let data_ptr = libc::CMSG_DATA(cmsg) as *mut u16;
+        *data_ptr = seg_size;
+        libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) as usize
+    };
+
+    let iov = libc::iovec {
+        iov_base: buf.as_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+
+    let msg = libc::msghdr {
+        msg_name: &addr as *const _ as *mut libc::c_void,
+        msg_namelen: std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        msg_iov: &iov as *const _ as *mut libc::iovec,
+        msg_iovlen: 1,
+        msg_control: cmsg_buf.as_mut_ptr() as *mut libc::c_void,
+        msg_controllen: cmsg_len as _,
+        msg_flags: 0,
+    };
+
+    let ret = unsafe { libc::sendmsg(fd, &msg, 0) };
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            std::thread::sleep(Duration::from_micros(50));
+            let ret = unsafe { libc::sendmsg(fd, &msg, 0) };
+            if ret >= 0 {
+                return Ok(ret as u64);
+            }
+        }
+        return Err(err.into());
+    }
+    Ok(ret as u64)
 }
