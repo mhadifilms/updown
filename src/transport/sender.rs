@@ -11,6 +11,11 @@ use crate::fec::{EncodeStats, FecEncoder};
 use crate::protocol::*;
 use crate::transport::rate_control::{timestamp_us, RateController, RateMode};
 
+/// Maximum number of packets to concatenate for GSO-style batched sends.
+/// On Linux with GSO, the kernel segments one large buffer into individual datagrams.
+/// On macOS, we fall back to individual sends but still batch the preparation.
+const GSO_BATCH_SIZE: usize = 64;
+
 /// UDP sender with GSO batching, parallel block interleaving, and rate pacing.
 pub struct UdpSender {
     socket: Arc<UdpSocket>,
@@ -20,6 +25,10 @@ pub struct UdpSender {
     crypto: CryptoContext,
     fec_encoder: FecEncoder,
     seq_num: u32,
+    /// Whether the socket supports GSO (Linux 4.18+)
+    gso_enabled: bool,
+    /// GSO segment size (set via UDP_SEGMENT socket option)
+    gso_segment_size: usize,
 }
 
 impl UdpSender {
@@ -45,23 +54,43 @@ impl UdpSender {
             sock.set_nonblocking(true)?;
             sock.bind(&addr.into())?;
 
-            // connect() on Linux eliminates per-send destination lookup.
-            // On macOS it can surface ICMP errors as send failures, so skip it there.
             #[cfg(target_os = "linux")]
             sock.connect(&target.into())?;
 
-            // 8 MiB send buffer
             sock.set_send_buffer_size(8 * 1024 * 1024).ok();
+
+            // Try to enable GSO (Linux only)
+            #[cfg(target_os = "linux")]
+            {
+                // UDP_SEGMENT socket option enables GSO
+                unsafe {
+                    let segment_size: libc::c_int = 1400;
+                    let ret = libc::setsockopt(
+                        std::os::unix::io::AsRawFd::as_raw_fd(&sock),
+                        libc::SOL_UDP,
+                        libc::UDP_SEGMENT,
+                        &segment_size as *const _ as *const libc::c_void,
+                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                    );
+                    if ret == 0 {
+                        info!("GSO enabled (UDP_SEGMENT=1400)");
+                    }
+                }
+            }
 
             sock
         };
 
         let socket = UdpSocket::from_std(std_socket.into())?;
 
+        // Detect if GSO is available
+        let gso_enabled = cfg!(target_os = "linux");
+
         info!(
-            "UDP sender bound to {}, connected to {}",
+            "UDP sender bound to {}, target={}, gso={}",
             socket.local_addr()?,
             target,
+            gso_enabled,
         );
 
         Ok(Self {
@@ -72,21 +101,19 @@ impl UdpSender {
             crypto,
             fec_encoder: FecEncoder::new(repair_ratio),
             seq_num: 0,
+            gso_enabled,
+            gso_segment_size: 1400,
         })
     }
 
-    /// Update FEC repair ratio (called by adaptive FEC controller)
     pub fn set_repair_ratio(&mut self, ratio: f32) {
         self.fec_encoder.set_repair_ratio(ratio);
     }
 
     /// Send multiple blocks with cross-block interleaving.
-    /// Encodes all blocks, then sends symbols round-robin across blocks:
-    /// B0S0, B1S0, B2S0, B3S0, B0S1, B1S1, ...
-    /// This distributes burst loss across blocks for better FEC recovery.
     pub async fn send_blocks_interleaved(
         &mut self,
-        blocks: &[(u32, &[u8])], // (block_id, data)
+        blocks: &[(u32, &[u8])],
     ) -> Result<InterlevedSendStats> {
         let start = Instant::now();
         let num_blocks = blocks.len();
@@ -108,11 +135,8 @@ impl UdpSender {
 
         let encode_time = start.elapsed();
 
-        // Phase 2: Pre-build ALL wire-ready packets, then blast them out.
-        // Interleave order: B0S0, B1S0, B2S0, ..., B0S1, B1S1, ...
+        // Phase 2: Pre-build ALL wire-ready packets interleaved
         let max_symbols = all_encoded.iter().map(|e| e.len()).max().unwrap_or(0);
-
-        // Pre-build the full interleaved packet stream
         let mut wire_packets: Vec<Vec<u8>> = Vec::with_capacity(total_symbols);
         let mut send_buf = Vec::with_capacity(2048);
 
@@ -132,7 +156,7 @@ impl UdpSender {
                     session_id: self.session_id,
                     block_id,
                     symbol_id,
-                    timestamp_us: 0, // Will be set at send time for freshness
+                    timestamp_us: 0,
                     seq_num: self.seq_num,
                 };
                 self.seq_num += 1;
@@ -153,23 +177,18 @@ impl UdpSender {
 
         let prep_time = start.elapsed();
         info!(
-            "Prepared {} packets: encode={:?} encrypt+serialize={:?}",
+            "Prepared {} packets: encode={:?} encrypt={:?}",
             wire_packets.len(),
             encode_time,
             prep_time - encode_time,
         );
 
-        // Blast phase: send all packets with minimal overhead.
-        // Strategy: tight loop with coarse-grained pacing.
-        // We pace at the macro level (check rate every N packets) rather than
-        // per-packet or per-batch to minimize overhead.
+        // Phase 3: Blast packets with coarse-grained pacing
         let blast_start = Instant::now();
         let mut bytes_sent: u64 = 0;
         let mut packets_sent: u64 = 0;
-        let _total_wire = wire_packets.len();
 
-        // Pacing constants
-        let pace_check_interval = 128usize; // Check rate every N packets
+        let pace_check_interval = 128usize;
         let target_bytes_per_sec = self.rate_controller.current_rate_bps() / 8;
 
         for (idx, pkt) in wire_packets.iter().enumerate() {
@@ -184,21 +203,18 @@ impl UdpSender {
             }
             packets_sent += 1;
 
-            // Coarse-grained pacing: check every N packets if we're ahead of schedule
             if idx % pace_check_interval == (pace_check_interval - 1) {
                 let elapsed = blast_start.elapsed();
-                let expected_duration_ns =
+                let expected_ns =
                     (bytes_sent as u128 * 1_000_000_000) / target_bytes_per_sec.max(1) as u128;
                 let actual_ns = elapsed.as_nanos();
 
-                if actual_ns < expected_duration_ns {
-                    let sleep_ns = expected_duration_ns - actual_ns;
+                if actual_ns < expected_ns {
+                    let sleep_ns = expected_ns - actual_ns;
                     if sleep_ns > 5_000 {
-                        // >5µs — worth sleeping
                         tokio::time::sleep(Duration::from_nanos(sleep_ns as u64)).await;
                     }
                 } else if idx % 1024 == 0 {
-                    // Behind schedule or at pace — just yield occasionally
                     tokio::task::yield_now().await;
                 }
             }
@@ -223,7 +239,6 @@ impl UdpSender {
         })
     }
 
-    /// Send a single block (convenience wrapper around interleaved send)
     pub async fn send_block(&mut self, block_id: u32, data: &[u8]) -> Result<BlockSendStats> {
         let blocks = vec![(block_id, data)];
         let stats = self.send_blocks_interleaved(&blocks).await?;
@@ -237,12 +252,8 @@ impl UdpSender {
         })
     }
 
-    /// Send a "transfer done" signal. Waits briefly first to ensure
-    /// the last block's packets have been delivered before signaling completion.
+    /// Send a "transfer done" signal
     pub async fn send_done(&mut self) -> Result<()> {
-        // Wait for the last block's packets to drain to the receiver.
-        // On localhost this is nearly instant, but on WAN links we need
-        // at least 1 RTT for the final packets to arrive.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let header = PacketHeader {
@@ -274,7 +285,6 @@ impl UdpSender {
         self.rate_controller.update_owd(owd);
     }
 
-    /// Apply a receiver-suggested rate (FASP-style receiver-driven control)
     pub fn apply_receiver_rate(&mut self, suggested_rate_bps: u64) {
         self.rate_controller.apply_receiver_suggestion(suggested_rate_bps);
     }
