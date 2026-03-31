@@ -39,6 +39,7 @@ pub struct UdpReceiver {
     pending_blocks: HashMap<u32, PendingBlock>,
     completed_blocks: Vec<u32>,
     block_data_len: u64,
+    file_size: u64,
     total_blocks: u32,
     /// Adaptive FEC controller
     adaptive_fec: AdaptiveFec,
@@ -55,6 +56,7 @@ impl UdpReceiver {
         session_id: u32,
         crypto: CryptoContext,
         block_data_len: u64,
+        file_size: u64,
         total_blocks: u32,
         target_rate_mbps: u64,
     ) -> Result<Self> {
@@ -87,6 +89,7 @@ impl UdpReceiver {
             pending_blocks: HashMap::new(),
             completed_blocks: Vec::new(),
             block_data_len,
+            file_size,
             total_blocks,
             adaptive_fec: AdaptiveFec::new(),
             rate_calc: ReceiverRateCalculator::new(target_rate_mbps),
@@ -226,10 +229,16 @@ impl UdpReceiver {
                     return Ok(None);
                 }
 
-                let block_data_len = self.block_data_len;
+                // Calculate correct block size (last block may be smaller)
+                let actual_block_len = if block_id == self.total_blocks - 1 {
+                    let offset = block_id as u64 * self.block_data_len;
+                    self.file_size - offset
+                } else {
+                    self.block_data_len
+                };
                 let pending = self.pending_blocks.entry(block_id).or_insert_with(|| {
                     PendingBlock {
-                        decoder: FecDecoder::new(block_data_len, SYMBOL_SIZE),
+                        decoder: FecDecoder::new(actual_block_len, SYMBOL_SIZE),
                         packets_received: 0,
                         first_packet_time: Instant::now(),
                     }

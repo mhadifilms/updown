@@ -1,12 +1,13 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use updown::engine::{RecvEngine, SendEngine};
-use updown::protocol::DEFAULT_BLOCK_SIZE;
+use updown::protocol::{ControlMessage, DEFAULT_BLOCK_SIZE};
+use updown::transport::control::{ControlClient, ControlServer};
 use updown::transport::rate_control::RateMode;
 
 #[derive(Parser)]
@@ -97,6 +98,21 @@ enum Commands {
         #[arg(long, default_value = "1")]
         session: u32,
     },
+    /// Start a receiver that auto-accepts transfers via QUIC negotiation.
+    /// Usage: updown serve --output ./downloads
+    Serve {
+        /// Address to listen on (QUIC control + UDP data)
+        #[arg(short, long, default_value = "0.0.0.0:9000")]
+        bind: SocketAddr,
+
+        /// Output directory for received files
+        #[arg(short, long, default_value = ".")]
+        output: PathBuf,
+
+        /// Target rate in Mbps
+        #[arg(short, long, default_value = "10000")]
+        rate: u64,
+    },
     /// Run a localhost benchmark (send + receive in same process)
     Bench {
         /// Size of test data in MB
@@ -162,8 +178,22 @@ async fn main() -> Result<()> {
             key,
             session: _,
         } => {
-            let shared_key = parse_hex_key(&key)?;
             let rate_mode = parse_rate_mode(&mode);
+
+            // Try QUIC auto-negotiation first
+            let negotiated = negotiate_send(&file, to, block_size).await;
+
+            let (shared_key, data_addr, session_id) = match negotiated {
+                Ok((key, addr, sid)) => {
+                    println!("Negotiated via QUIC control channel");
+                    (key, addr, sid)
+                }
+                Err(_) => {
+                    // Fall back to pre-shared key mode
+                    let key = parse_hex_key(&key)?;
+                    (key, to, rand::random())
+                }
+            };
 
             let engine = SendEngine::new(rate, rate_mode)
                 .with_block_size(block_size)
@@ -171,7 +201,9 @@ async fn main() -> Result<()> {
                 .with_interleave(interleave)
                 .with_compression(compress);
 
-            let result = engine.send_file(&file, to, &shared_key).await?;
+            let result = engine
+                .send_file_with_session(&file, data_addr, &shared_key, session_id)
+                .await?;
 
             println!("\n--- Transfer Complete ---");
             println!("  File size:     {} bytes", result.file_size);
@@ -222,6 +254,14 @@ async fn main() -> Result<()> {
             println!("  FEC ratio rec: {:.1}%", result.final_fec_ratio * 100.0);
         }
 
+        Commands::Serve {
+            bind,
+            output,
+            rate,
+        } => {
+            run_serve(bind, output, rate).await?;
+        }
+
         Commands::Bench {
             size_mb,
             rate,
@@ -234,6 +274,192 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Try to negotiate transfer via QUIC control channel with a `serve` endpoint.
+/// Returns (shared_key, data_addr, session_id) on success.
+async fn negotiate_send(
+    file_path: &Path,
+    server_addr: SocketAddr,
+    block_size: usize,
+) -> Result<([u8; 32], SocketAddr, u32)> {
+    use tokio::fs::File;
+    use tokio::io::AsyncReadExt;
+
+    let metadata = tokio::fs::metadata(file_path).await?;
+    let file_size = metadata.len();
+    let filename = file_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let total_blocks = ((file_size as usize + block_size - 1) / block_size) as u32;
+
+    // Hash the file
+    let file_hash = {
+        let mut hasher = blake3::Hasher::new();
+        let mut f = File::open(file_path).await?;
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let n = f.read(&mut buf).await?;
+            if n == 0 { break; }
+            hasher.update(&buf[..n]);
+        }
+        *hasher.finalize().as_bytes()
+    };
+
+    let session_id: u32 = rand::random();
+
+    // Connect to server's QUIC control channel
+    let mut conn = ControlClient::connect(server_addr).await?;
+
+    // Send transfer request
+    conn.send_msg(&ControlMessage::TransferRequest {
+        session_id,
+        filename,
+        file_size,
+        block_size: block_size as u32,
+        total_blocks,
+        blake3_hash: file_hash,
+        data_port: 0, // Server will tell us
+    })
+    .await?;
+
+    // Receive accept
+    let msg = conn.recv_msg().await?;
+    let data_port = match msg {
+        ControlMessage::TransferAccept { data_port, .. } => data_port,
+        ControlMessage::TransferReject { reason, .. } => {
+            anyhow::bail!("Transfer rejected: {}", reason);
+        }
+        _ => anyhow::bail!("Unexpected response"),
+    };
+
+    // Receive key exchange
+    let msg = conn.recv_msg().await?;
+    let shared_key = match msg {
+        ControlMessage::KeyExchange { public_key, .. } => {
+            let mut key = [0u8; 32];
+            if public_key.len() != 32 {
+                anyhow::bail!("Invalid key length");
+            }
+            key.copy_from_slice(&public_key);
+            key
+        }
+        _ => anyhow::bail!("Expected KeyExchange"),
+    };
+
+    let data_addr = SocketAddr::new(server_addr.ip(), data_port);
+    Ok((shared_key, data_addr, session_id))
+}
+
+async fn run_serve(bind: SocketAddr, output: PathBuf, rate_mbps: u64) -> Result<()> {
+    println!("=== updown server ===");
+    println!("  Listening on:  {}", bind);
+    println!("  Output dir:    {}", output.display());
+    println!("  Target rate:   {} Mbps", rate_mbps);
+    println!();
+    println!("Waiting for incoming transfers...");
+    println!("  Sender runs: updown send <file> --to {}",  bind);
+    println!();
+
+    // QUIC control server on the bind port
+    let control = ControlServer::bind(bind).await?;
+
+    loop {
+        // Accept incoming QUIC connection from sender
+        let mut conn = control.accept().await?;
+
+        // Receive transfer request
+        let msg = conn.recv_msg().await?;
+        let (session_id, filename, file_size, block_size, total_blocks, file_hash) = match msg {
+            ControlMessage::TransferRequest {
+                session_id,
+                filename,
+                file_size,
+                block_size,
+                total_blocks,
+                blake3_hash,
+                data_port: _,
+            } => (
+                session_id,
+                filename,
+                file_size,
+                block_size as usize,
+                total_blocks,
+                blake3_hash,
+            ),
+            _ => {
+                eprintln!("Unexpected control message, expected TransferRequest");
+                continue;
+            }
+        };
+
+        println!(
+            "Incoming: {} ({} bytes, {} blocks)",
+            filename, file_size, total_blocks
+        );
+
+        // Generate shared encryption key and send accept with key exchange
+        let shared_key: [u8; 32] = rand::random();
+
+        // Pick a UDP data port (use bind port + 1)
+        let data_port = bind.port() + 1;
+        let data_addr = SocketAddr::new(bind.ip(), data_port);
+
+        // Send accept with key exchange
+        conn.send_msg(&ControlMessage::TransferAccept {
+            session_id,
+            data_port,
+        })
+        .await?;
+
+        // Exchange encryption key (simplified: send key over the TLS-encrypted QUIC channel)
+        conn.send_msg(&ControlMessage::KeyExchange {
+            session_id,
+            public_key: shared_key.to_vec(),
+        })
+        .await?;
+
+        // Start receiving
+        let engine = RecvEngine::new(output.clone())
+            .with_block_size(block_size)
+            .with_target_rate(rate_mbps);
+
+        let result = engine
+            .receive_file(
+                data_addr,
+                session_id,
+                &filename,
+                file_size,
+                total_blocks,
+                &shared_key,
+            )
+            .await?;
+
+        // Send completion
+        conn.send_msg(&ControlMessage::TransferComplete {
+            session_id,
+            success: result.blake3_hash == file_hash,
+            bytes_transferred: result.file_size,
+            duration_ms: result.elapsed.as_millis() as u64,
+        })
+        .await
+        .ok();
+
+        let hash_match = result.blake3_hash == file_hash;
+        println!("\n--- Receive Complete ---");
+        println!("  File:          {}", result.output_path.display());
+        println!("  Size:          {} bytes", result.file_size);
+        println!("  Rate:          {:.1} Mbps", result.rate_mbps);
+        println!("  Time:          {:.2?}", result.elapsed);
+        println!(
+            "  Integrity:     {}",
+            if hash_match { "PASS" } else { "FAIL" }
+        );
+        println!();
+        println!("Waiting for next transfer...");
+    }
 }
 
 async fn run_benchmark(

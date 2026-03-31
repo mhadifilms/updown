@@ -237,8 +237,14 @@ impl UdpSender {
         })
     }
 
-    /// Send a "transfer done" signal
+    /// Send a "transfer done" signal. Waits briefly first to ensure
+    /// the last block's packets have been delivered before signaling completion.
     pub async fn send_done(&mut self) -> Result<()> {
+        // Wait for the last block's packets to drain to the receiver.
+        // On localhost this is nearly instant, but on WAN links we need
+        // at least 1 RTT for the final packets to arrive.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
         let header = PacketHeader {
             magic: MAGIC,
             packet_type: PacketType::Done,

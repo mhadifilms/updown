@@ -94,6 +94,7 @@ impl RecvEngine {
             session_id,
             crypto,
             self.block_size as u64,
+            file_size,
             total_blocks,
             self.target_rate_mbps,
         )
