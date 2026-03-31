@@ -11,11 +11,6 @@ use crate::fec::{EncodeStats, FecEncoder};
 use crate::protocol::*;
 use crate::transport::rate_control::{timestamp_us, RateController, RateMode};
 
-/// Maximum number of packets to concatenate for GSO-style batched sends.
-/// On Linux with GSO, the kernel segments one large buffer into individual datagrams.
-/// On macOS, we fall back to individual sends but still batch the preparation.
-const GSO_BATCH_SIZE: usize = 64;
-
 /// UDP sender with GSO batching, parallel block interleaving, and rate pacing.
 pub struct UdpSender {
     socket: Arc<UdpSocket>,
@@ -25,10 +20,6 @@ pub struct UdpSender {
     crypto: CryptoContext,
     fec_encoder: FecEncoder,
     seq_num: u32,
-    /// Whether the socket supports GSO (Linux 4.18+)
-    gso_enabled: bool,
-    /// GSO segment size (set via UDP_SEGMENT socket option)
-    gso_segment_size: usize,
 }
 
 impl UdpSender {
@@ -101,8 +92,6 @@ impl UdpSender {
             crypto,
             fec_encoder: FecEncoder::new(repair_ratio),
             seq_num: 0,
-            gso_enabled,
-            gso_segment_size: 1400,
         })
     }
 

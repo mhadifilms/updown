@@ -2,10 +2,11 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::crypto::CryptoContext;
@@ -75,10 +76,7 @@ impl SendEngine {
     ) -> Result<SendResult> {
         let start = Instant::now();
 
-        let mut file = File::open(file_path)
-            .await
-            .context("failed to open file")?;
-        let metadata = file.metadata().await?;
+        let metadata = tokio::fs::metadata(file_path).await?;
         let file_size = metadata.len();
         let filename = file_path
             .file_name()
@@ -88,17 +86,15 @@ impl SendEngine {
 
         let total_blocks = ((file_size as usize + self.block_size - 1) / self.block_size) as u32;
 
-        // Compute file hash (stream it instead of loading all into memory for large files)
+        // Stream-hash the file
         let file_hash = {
             let mut hasher = blake3::Hasher::new();
-            let mut hash_file = File::open(file_path).await?;
-            let mut hash_buf = vec![0u8; 256 * 1024]; // 256 KB chunks
+            let mut f = File::open(file_path).await?;
+            let mut buf = vec![0u8; 256 * 1024];
             loop {
-                let n = hash_file.read(&mut hash_buf).await?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&hash_buf[..n]);
+                let n = f.read(&mut buf).await?;
+                if n == 0 { break; }
+                hasher.update(&buf[..n]);
             }
             hasher.finalize()
         };
@@ -134,52 +130,70 @@ impl SendEngine {
         let mut total_bytes_sent: u64 = 0;
         let mut total_packets_sent: u64 = 0;
 
-        // Pre-allocate block read buffers for the interleave group
-        let mut block_bufs: Vec<Vec<u8>> = (0..self.interleave_depth)
-            .map(|_| vec![0u8; self.block_size])
-            .collect();
+        // Pipeline: read+encode on a background task, send on this task.
+        // Channel depth of 2 = double-buffering (group N sends while group N+1 encodes).
+        let (group_tx, mut group_rx) = mpsc::channel::<Vec<(u32, Vec<u8>)>>(2);
 
-        // Stream blocks: read one interleave group at a time
-        let mut block_id = 0u32;
-        file.seek(std::io::SeekFrom::Start(0)).await?;
+        let block_size = self.block_size;
+        let interleave = self.interleave_depth;
+        let compress = self.compress;
+        let file_path_owned = file_path.to_path_buf();
 
-        while block_id < total_blocks {
-            let group_end = (block_id + self.interleave_depth as u32).min(total_blocks);
-            let group_size = (group_end - block_id) as usize;
-
-            // Read the group of blocks from disk
-            let mut block_slices: Vec<(u32, usize)> = Vec::with_capacity(group_size);
-            for i in 0..group_size {
-                let bid = block_id + i as u32;
-                let offset = bid as u64 * self.block_size as u64;
-                let remaining = (file_size - offset) as usize;
-                let this_block_size = remaining.min(self.block_size);
-
-                file.read_exact(&mut block_bufs[i][..this_block_size]).await?;
-
-                // Optional compression
-                if self.compress {
-                    let compressed = zstd::bulk::compress(&block_bufs[i][..this_block_size], 1)?;
-                    if compressed.len() < this_block_size {
-                        // Compression helped — use compressed data
-                        block_bufs[i][..compressed.len()].copy_from_slice(&compressed);
-                        block_slices.push((bid, compressed.len()));
-                    } else {
-                        block_slices.push((bid, this_block_size));
-                    }
-                } else {
-                    block_slices.push((bid, this_block_size));
-                }
-            }
-
-            // Build the (block_id, data) pairs for the sender
-            let blocks: Vec<(u32, &[u8])> = block_slices
-                .iter()
-                .enumerate()
-                .map(|(i, (bid, len))| (*bid, &block_bufs[i][..*len]))
+        // Spawn reader/encoder pipeline
+        let reader_handle = tokio::spawn(async move {
+            let mut file = File::open(&file_path_owned).await?;
+            let mut block_bufs: Vec<Vec<u8>> = (0..interleave)
+                .map(|_| vec![0u8; block_size])
                 .collect();
 
-            let stats = sender.send_blocks_interleaved(&blocks).await?;
+            let mut bid = 0u32;
+            while bid < total_blocks {
+                let group_end = (bid + interleave as u32).min(total_blocks);
+                let group_size = (group_end - bid) as usize;
+
+                let mut group: Vec<(u32, Vec<u8>)> = Vec::with_capacity(group_size);
+
+                for i in 0..group_size {
+                    let current_bid = bid + i as u32;
+                    let offset = current_bid as u64 * block_size as u64;
+                    let remaining = (file_size - offset) as usize;
+                    let this_block_size = remaining.min(block_size);
+
+                    file.read_exact(&mut block_bufs[i][..this_block_size]).await?;
+
+                    let data = if compress {
+                        let compressed =
+                            zstd::bulk::compress(&block_bufs[i][..this_block_size], 1)?;
+                        if compressed.len() < this_block_size {
+                            compressed
+                        } else {
+                            block_bufs[i][..this_block_size].to_vec()
+                        }
+                    } else {
+                        block_bufs[i][..this_block_size].to_vec()
+                    };
+
+                    group.push((current_bid, data));
+                }
+
+                if group_tx.send(group).await.is_err() {
+                    break; // Receiver dropped
+                }
+
+                bid = group_end;
+            }
+
+            Ok::<(), anyhow::Error>(())
+        });
+
+        // Send loop: receives prepared groups from the pipeline
+        while let Some(group) = group_rx.recv().await {
+            let block_refs: Vec<(u32, &[u8])> =
+                group.iter().map(|(id, data)| (*id, data.as_slice())).collect();
+
+            let group_end = group.last().map(|(id, _)| id + 1).unwrap_or(0);
+
+            let stats = sender.send_blocks_interleaved(&block_refs).await?;
 
             total_bytes_sent += stats.bytes_sent;
             total_packets_sent += stats.packets_sent;
@@ -187,15 +201,15 @@ impl SendEngine {
             let progress_pos = (group_end as u64 * self.block_size as u64).min(file_size);
             pb.set_position(progress_pos);
             pb.set_message(format!(
-                "blk {}-{}/{} @ {:.0} Mbps",
-                block_id,
-                group_end - 1,
+                "blk {}/{} @ {:.0} Mbps",
+                group_end,
                 total_blocks,
                 stats.rate_mbps
             ));
-
-            block_id = group_end;
         }
+
+        // Wait for reader to finish
+        reader_handle.await??;
 
         sender.send_done().await?;
         pb.finish_with_message("transfer complete");

@@ -631,27 +631,26 @@ async fn run_benchmark(
 
     let hashes_match = send_result.file_hash == recv_result.blake3_hash;
 
+    let effective_rate = (file_size as f64 * 8.0) / (total_elapsed.as_secs_f64() * 1_000_000.0);
+    let fec_overhead = ((send_result.total_bytes_sent as f64 / file_size as f64) - 1.0) * 100.0;
+
     println!();
-    println!("=== Results ===");
-    println!("  Total time:      {:.2?}", total_elapsed);
     println!(
-        "  Effective rate:  {:.1} Mbps",
-        (file_size as f64 * 8.0) / (total_elapsed.as_secs_f64() * 1_000_000.0)
-    );
-    println!("  Send rate:       {:.1} Mbps", send_result.rate_mbps);
-    println!("  Recv rate:       {:.1} Mbps", recv_result.rate_mbps);
-    println!("  Packets sent:    {}", send_result.total_packets_sent);
-    println!("  Packets recv:    {}", recv_result.total_packets);
-    println!(
-        "  FEC overhead:    {:.1}%",
-        ((send_result.total_bytes_sent as f64 / file_size as f64) - 1.0) * 100.0
-    );
-    println!("  Excess symbols:  {}", recv_result.total_excess_symbols);
-    println!("  Loss estimate:   {:.2}%", recv_result.final_loss_estimate * 100.0);
-    println!("  Adaptive FEC:    {:.1}%", recv_result.final_fec_ratio * 100.0);
-    println!(
-        "  Integrity:       {}",
-        if hashes_match { "PASS" } else { "FAIL" }
+        "{}",
+        updown::engine::stats::format_benchmark_result(
+            size_mb,
+            send_result.rate_mbps,
+            recv_result.rate_mbps,
+            effective_rate,
+            send_result.total_packets_sent,
+            recv_result.total_packets,
+            fec_overhead,
+            recv_result.final_loss_estimate,
+            recv_result.final_fec_ratio,
+            recv_result.total_excess_symbols,
+            total_elapsed,
+            hashes_match,
+        )
     );
     println!("  Source hash:     {}", hex::encode(send_result.file_hash));
     println!("  Received hash:   {}", hex::encode(recv_result.blake3_hash));
