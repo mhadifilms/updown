@@ -1,0 +1,60 @@
+[package]
+name = "updown"
+version = "0.1.0"
+edition = "2021"
+description = "Blazing fast file transfer using UDP, fountain codes, and rate-based congestion control"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# UDP socket configuration
+socket2 = { version = "0.5", features = ["all"] }
+
+# Fountain codes (FEC) - replaces ACK/retransmit
+raptorq = "2"
+
+# Encryption - AES-256-GCM via AES-NI (~3.3 GiB/s)
+ring = "0.17"
+
+# Fast hashing for block checksums
+blake3 = "1"
+
+# QUIC for control channel
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Byte manipulation
+bytes = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Progress display
+indicatif = "0.17"
+
+# Error handling
+anyhow = "1"
+
+# Random bytes for nonces/keys
+rand = "0.8"
+
+# Hex encoding for keys/hashes
+hex = "0.4"
+
+# Temp files for benchmarks
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
