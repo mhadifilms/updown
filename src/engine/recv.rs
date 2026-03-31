@@ -4,12 +4,13 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use tokio::fs::{self, File};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::fs::{self, File, OpenOptions};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::crypto::CryptoContext;
+use crate::engine::resume::ResumeState;
 use crate::protocol::*;
 use crate::transport::receiver::UdpReceiver;
 
@@ -51,14 +52,40 @@ impl RecvEngine {
 
         fs::create_dir_all(&self.output_dir).await.ok();
         let output_path = self.output_dir.join(filename);
-        info!("Receiving {} -> {}", filename, output_path.display());
 
-        let mut file = File::create(&output_path)
+        // Check for existing resume state
+        let mut resume = ResumeState::load(
+            &output_path,
+            session_id,
+            file_size,
+            self.block_size,
+            total_blocks,
+        )
+        .await?
+        .unwrap_or_else(|| {
+            ResumeState::new(session_id, file_size, self.block_size, total_blocks)
+        });
+
+        let already_complete = resume.completed_count();
+        if already_complete > 0 {
+            info!(
+                "Resuming: {}/{} blocks already received",
+                already_complete, total_blocks
+            );
+        }
+
+        // Open file for writing (create or open existing for resume)
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&output_path)
             .await
-            .context("failed to create output file")?;
+            .context("failed to open output file")?;
 
-        // Pre-allocate file (FASP Fig 4 step 406: "allocate storage space")
+        // Pre-allocate file
         file.set_len(file_size).await?;
+
+        info!("Receiving {} -> {}", filename, output_path.display());
 
         let crypto = CryptoContext::from_key(shared_key)?;
 
@@ -83,15 +110,24 @@ impl RecvEngine {
                 .progress_chars("=>-"),
         );
 
-        let (block_tx, mut block_rx) = mpsc::channel(64);
+        // Set progress to already-received bytes
+        let already_bytes = already_complete as u64 * self.block_size as u64;
+        pb.set_position(already_bytes.min(file_size));
 
+        let (block_tx, mut block_rx) = mpsc::channel(64);
         let recv_handle = tokio::spawn(async move { receiver.receive_loop(block_tx).await });
 
-        let mut blocks_written = 0u32;
-        let mut bytes_written = 0u64;
+        let mut blocks_written = already_complete;
+        let mut bytes_written = already_bytes.min(file_size);
         let mut total_excess_symbols = 0u64;
+        let mut blocks_since_save = 0u32;
 
         while let Some(block) = block_rx.recv().await {
+            // Skip if already received (resume case or duplicate)
+            if resume.is_complete(block.block_id) {
+                continue;
+            }
+
             let offset = block.block_id as u64 * self.block_size as u64;
 
             let actual_len = if block.block_id == total_blocks - 1 {
@@ -101,12 +137,24 @@ impl RecvEngine {
                 self.block_size
             };
 
+            // Write block data
             file.seek(std::io::SeekFrom::Start(offset)).await?;
             file.write_all(&block.data[..actual_len]).await?;
 
+            // Hash the block for resume verification
+            let block_hash = blake3::hash(&block.data[..actual_len]);
+            resume.mark_complete(block.block_id, *block_hash.as_bytes());
+
             blocks_written += 1;
-            bytes_written += actual_len as u64;
+            bytes_written = (blocks_written as u64 * self.block_size as u64).min(file_size);
             total_excess_symbols += block.decode_stats.excess_symbols as u64;
+            blocks_since_save += 1;
+
+            // Persist resume state every 8 blocks
+            if blocks_since_save >= 8 {
+                resume.save(&output_path).await.ok();
+                blocks_since_save = 0;
+            }
 
             pb.set_position(bytes_written);
             pb.set_message(format!(
@@ -129,8 +177,28 @@ impl RecvEngine {
 
         let recv_stats = recv_handle.await??;
 
-        let received_data = tokio::fs::read(&output_path).await?;
-        let received_hash = blake3::hash(&received_data);
+        // Compute final file hash (streaming for large files)
+        let received_hash = {
+            let mut hasher = blake3::Hasher::new();
+            let mut f = File::open(&output_path).await?;
+            let mut buf = vec![0u8; 256 * 1024];
+            loop {
+                let n = f.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            hasher.finalize()
+        };
+
+        // Clean up resume file on successful completion
+        if resume.is_transfer_complete() {
+            ResumeState::cleanup(&output_path).await;
+        } else {
+            // Save final state for future resume
+            resume.save(&output_path).await.ok();
+        }
 
         let elapsed = start.elapsed();
         let rate_mbps = if elapsed.as_secs_f64() > 0.0 {

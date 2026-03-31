@@ -5,6 +5,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::info;
 
 use crate::crypto::CryptoContext;
@@ -12,7 +13,6 @@ use crate::protocol::*;
 use crate::transport::rate_control::RateMode;
 use crate::transport::sender::UdpSender;
 
-/// Default number of blocks to interleave (send in parallel)
 const DEFAULT_INTERLEAVE: usize = 4;
 
 pub struct SendEngine {
@@ -21,6 +21,7 @@ pub struct SendEngine {
     block_size: usize,
     repair_ratio: f32,
     interleave_depth: usize,
+    compress: bool,
 }
 
 impl SendEngine {
@@ -31,6 +32,7 @@ impl SendEngine {
             block_size: DEFAULT_BLOCK_SIZE,
             repair_ratio: 0.15,
             interleave_depth: DEFAULT_INTERLEAVE,
+            compress: false,
         }
     }
 
@@ -46,6 +48,11 @@ impl SendEngine {
 
     pub fn with_interleave(mut self, depth: usize) -> Self {
         self.interleave_depth = depth.max(1);
+        self
+    }
+
+    pub fn with_compression(mut self, enabled: bool) -> Self {
+        self.compress = enabled;
         self
     }
 
@@ -68,7 +75,7 @@ impl SendEngine {
     ) -> Result<SendResult> {
         let start = Instant::now();
 
-        let file = File::open(file_path)
+        let mut file = File::open(file_path)
             .await
             .context("failed to open file")?;
         let metadata = file.metadata().await?;
@@ -81,15 +88,25 @@ impl SendEngine {
 
         let total_blocks = ((file_size as usize + self.block_size - 1) / self.block_size) as u32;
 
-        info!(
-            "Sending {} ({} bytes, {} blocks, interleave={})",
-            filename, file_size, total_blocks, self.interleave_depth
-        );
-
+        // Compute file hash (stream it instead of loading all into memory for large files)
         let file_hash = {
-            let file_bytes = tokio::fs::read(file_path).await?;
-            blake3::hash(&file_bytes)
+            let mut hasher = blake3::Hasher::new();
+            let mut hash_file = File::open(file_path).await?;
+            let mut hash_buf = vec![0u8; 256 * 1024]; // 256 KB chunks
+            loop {
+                let n = hash_file.read(&mut hash_buf).await?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&hash_buf[..n]);
+            }
+            hasher.finalize()
         };
+
+        info!(
+            "Sending {} ({} bytes, {} blocks, interleave={}, compress={})",
+            filename, file_size, total_blocks, self.interleave_depth, self.compress
+        );
 
         let crypto = CryptoContext::from_key(shared_key)?;
 
@@ -117,25 +134,52 @@ impl SendEngine {
         let mut total_bytes_sent: u64 = 0;
         let mut total_packets_sent: u64 = 0;
 
-        // Read entire file into memory for interleaved sending
-        // (Phase 3 will use io_uring + O_DIRECT for streaming)
-        let file_data = tokio::fs::read(file_path).await?;
+        // Pre-allocate block read buffers for the interleave group
+        let mut block_bufs: Vec<Vec<u8>> = (0..self.interleave_depth)
+            .map(|_| vec![0u8; self.block_size])
+            .collect();
 
-        // Send blocks in interleaved groups
+        // Stream blocks: read one interleave group at a time
         let mut block_id = 0u32;
-        while block_id < total_blocks {
-            // Collect a group of blocks for interleaved sending
-            let group_end = (block_id + self.interleave_depth as u32).min(total_blocks);
-            let mut block_group: Vec<(u32, &[u8])> = Vec::new();
+        file.seek(std::io::SeekFrom::Start(0)).await?;
 
-            for bid in block_id..group_end {
-                let offset = bid as usize * self.block_size;
-                let end = (offset + self.block_size).min(file_data.len());
-                block_group.push((bid, &file_data[offset..end]));
+        while block_id < total_blocks {
+            let group_end = (block_id + self.interleave_depth as u32).min(total_blocks);
+            let group_size = (group_end - block_id) as usize;
+
+            // Read the group of blocks from disk
+            let mut block_slices: Vec<(u32, usize)> = Vec::with_capacity(group_size);
+            for i in 0..group_size {
+                let bid = block_id + i as u32;
+                let offset = bid as u64 * self.block_size as u64;
+                let remaining = (file_size - offset) as usize;
+                let this_block_size = remaining.min(self.block_size);
+
+                file.read_exact(&mut block_bufs[i][..this_block_size]).await?;
+
+                // Optional compression
+                if self.compress {
+                    let compressed = zstd::bulk::compress(&block_bufs[i][..this_block_size], 1)?;
+                    if compressed.len() < this_block_size {
+                        // Compression helped — use compressed data
+                        block_bufs[i][..compressed.len()].copy_from_slice(&compressed);
+                        block_slices.push((bid, compressed.len()));
+                    } else {
+                        block_slices.push((bid, this_block_size));
+                    }
+                } else {
+                    block_slices.push((bid, this_block_size));
+                }
             }
 
-            // Send the interleaved group
-            let stats = sender.send_blocks_interleaved(&block_group).await?;
+            // Build the (block_id, data) pairs for the sender
+            let blocks: Vec<(u32, &[u8])> = block_slices
+                .iter()
+                .enumerate()
+                .map(|(i, (bid, len))| (*bid, &block_bufs[i][..*len]))
+                .collect();
+
+            let stats = sender.send_blocks_interleaved(&blocks).await?;
 
             total_bytes_sent += stats.bytes_sent;
             total_packets_sent += stats.packets_sent;
@@ -143,7 +187,7 @@ impl SendEngine {
             let progress_pos = (group_end as u64 * self.block_size as u64).min(file_size);
             pb.set_position(progress_pos);
             pb.set_message(format!(
-                "blocks {}-{}/{} @ {:.0} Mbps",
+                "blk {}-{}/{} @ {:.0} Mbps",
                 block_id,
                 group_end - 1,
                 total_blocks,

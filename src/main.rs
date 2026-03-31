@@ -51,6 +51,10 @@ enum Commands {
         #[arg(long, default_value = "4")]
         interleave: usize,
 
+        /// Enable zstd compression
+        #[arg(long)]
+        compress: bool,
+
         /// Pre-shared key (hex encoded, 32 bytes)
         #[arg(long, default_value = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")]
         key: String,
@@ -154,6 +158,7 @@ async fn main() -> Result<()> {
             fec_ratio,
             block_size,
             interleave,
+            compress,
             key,
             session: _,
         } => {
@@ -163,7 +168,8 @@ async fn main() -> Result<()> {
             let engine = SendEngine::new(rate, rate_mode)
                 .with_block_size(block_size)
                 .with_repair_ratio(fec_ratio)
-                .with_interleave(interleave);
+                .with_interleave(interleave)
+                .with_compression(compress);
 
             let result = engine.send_file(&file, to, &shared_key).await?;
 

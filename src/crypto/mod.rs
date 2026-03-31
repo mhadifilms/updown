@@ -101,6 +101,31 @@ impl CryptoContext {
             .map_err(|e| anyhow::anyhow!("encryption failed: {}", e))
     }
 
+    /// Encrypt into a pre-allocated buffer. Writes [nonce][ciphertext][tag].
+    /// Returns the number of bytes written. The buffer must have capacity for
+    /// NONCE_LEN + plaintext.len() + TAG_LEN bytes starting at `offset`.
+    pub fn encrypt_into(
+        &mut self,
+        plaintext: &[u8],
+        aad: &[u8],
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
+        let nonce_bytes = self.next_nonce();
+        let nonce =
+            Nonce::try_assume_unique_for_key(&nonce_bytes).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        let start = buf.len();
+        buf.extend_from_slice(&nonce_bytes);
+        buf.extend_from_slice(plaintext);
+
+        let tag = self
+            .key
+            .seal_in_place_separate_tag(nonce, Aad::from(aad), &mut buf[start + NONCE_LEN..])
+            .map_err(|e| anyhow::anyhow!("encryption failed: {}", e))?;
+        buf.extend_from_slice(tag.as_ref());
+        Ok(())
+    }
+
     /// Decrypt data. Input format: [nonce (12 bytes)][ciphertext][tag (16 bytes)]
     pub fn decrypt(&self, ciphertext_with_nonce: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         if ciphertext_with_nonce.len() < NONCE_LEN + TAG_LEN {
