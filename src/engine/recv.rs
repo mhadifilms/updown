@@ -50,8 +50,11 @@ impl RecvEngine {
     ) -> Result<RecvResult> {
         let start = Instant::now();
 
-        fs::create_dir_all(&self.output_dir).await.ok();
         let output_path = self.output_dir.join(filename);
+        // Create parent directories (supports subdirectory paths like "subdir/file.bin")
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).await.ok();
+        }
 
         // Check for existing resume state
         let mut resume = ResumeState::load(

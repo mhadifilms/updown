@@ -13,6 +13,7 @@ use crate::crypto::CryptoContext;
 use crate::fec::{AdaptiveFec, DecodeStats, FecDecoder};
 use crate::protocol::*;
 use crate::transport::rate_control::{timestamp_us, ReceiverRateCalculator};
+use crate::transport::timeout_predictor::TimeoutPredictor;
 
 /// A block being received and decoded
 struct PendingBlock {
@@ -45,6 +46,10 @@ pub struct UdpReceiver {
     adaptive_fec: AdaptiveFec,
     /// Receiver-side rate calculator (FASP Fig 7)
     rate_calc: ReceiverRateCalculator,
+    /// Timeout predictor (FASP Fig 2, module 240)
+    timeout_predictor: TimeoutPredictor,
+    /// When we started expecting each block
+    block_expect_times: HashMap<u32, Instant>,
     /// Stats
     total_packets_received: u64,
     total_bytes_received: u64,
@@ -93,6 +98,8 @@ impl UdpReceiver {
             total_blocks,
             adaptive_fec: AdaptiveFec::new(),
             rate_calc: ReceiverRateCalculator::new(target_rate_mbps),
+            timeout_predictor: TimeoutPredictor::new(target_rate_mbps, block_data_len as usize),
+            block_expect_times: HashMap::new(),
             total_packets_received: 0,
             total_bytes_received: 0,
         })
@@ -143,13 +150,27 @@ impl UdpReceiver {
             match self.process_packet(&buf[..len]).await {
                 Ok(Some(block)) => {
                     // Feed decode stats to adaptive FEC
-                    let new_ratio = self.adaptive_fec.update(&block.decode_stats);
+                    let mut new_ratio = self.adaptive_fec.update(&block.decode_stats);
+
+                    // Feed to timeout predictor
+                    if let Some(expect_time) = self.block_expect_times.remove(&block.block_id) {
+                        let late = self.timeout_predictor.record_arrival(
+                            block.block_id,
+                            expect_time,
+                            block.data.len(),
+                        );
+                        if late {
+                            // Boost FEC for late blocks
+                            let boost = self.timeout_predictor.fec_boost_factor();
+                            new_ratio *= boost;
+                        }
+                    }
 
                     // Feed to receiver rate calculator
                     self.rate_calc.compute_rate(self.adaptive_fec.loss_estimate());
 
                     info!(
-                        "Block {} decoded: {} pkts, excess={}, loss={:.2}%, new_fec_ratio={:.1}%",
+                        "Block {} decoded: {} pkts, excess={}, loss={:.2}%, fec={:.1}%",
                         block.block_id,
                         block.packets_received,
                         block.decode_stats.excess_symbols,
@@ -228,6 +249,9 @@ impl UdpReceiver {
                 if self.completed_blocks.contains(&block_id) {
                     return Ok(None);
                 }
+
+                // Record when we first started expecting this block
+                self.block_expect_times.entry(block_id).or_insert_with(Instant::now);
 
                 // Calculate correct block size (last block may be smaller)
                 let actual_block_len = if block_id == self.total_blocks - 1 {

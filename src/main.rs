@@ -216,11 +216,25 @@ async fn main() -> Result<()> {
 
                 // Negotiate each file via QUIC (or fall back to PSK)
                 let negotiated = negotiate_send(path, to, block_size).await;
-                let (shared_key, data_addr, session_id) = match negotiated {
-                    Ok((key, addr, sid)) => (key, addr, sid),
+                let (shared_key, data_addr, session_id, _delta_hashes) = match negotiated {
+                    Ok(nr) => {
+                        if !nr.receiver_block_hashes.is_empty() {
+                            // Delta sync available — compute which blocks changed
+                            let source_hashes = updown::engine::delta::compute_block_hashes(path, block_size).await?;
+                            let changed = updown::engine::delta::diff_block_hashes(&source_hashes, &nr.receiver_block_hashes);
+                            let stats = updown::engine::delta::DeltaSyncStats::from_diff(
+                                source_hashes.len() as u32, &changed
+                            );
+                            println!(
+                                "    Delta: {}/{} blocks changed ({:.0}% savings)",
+                                stats.changed_blocks, stats.total_blocks, stats.savings_percent
+                            );
+                        }
+                        (nr.shared_key, nr.data_addr, nr.session_id, nr.receiver_block_hashes)
+                    }
                     Err(_) => {
                         let key = parse_hex_key(&key)?;
-                        (key, to, rand::random())
+                        (key, to, rand::random(), Vec::new())
                     }
                 };
 
@@ -301,13 +315,21 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Result of QUIC negotiation
+struct NegotiateResult {
+    shared_key: [u8; 32],
+    data_addr: SocketAddr,
+    session_id: u32,
+    /// Block hashes from receiver (for delta sync). Empty if no existing file.
+    receiver_block_hashes: Vec<[u8; 32]>,
+}
+
 /// Try to negotiate transfer via QUIC control channel with a `serve` endpoint.
-/// Returns (shared_key, data_addr, session_id) on success.
 async fn negotiate_send(
     file_path: &Path,
     server_addr: SocketAddr,
     block_size: usize,
-) -> Result<([u8; 32], SocketAddr, u32)> {
+) -> Result<NegotiateResult> {
     use tokio::fs::File;
     use tokio::io::AsyncReadExt;
 
@@ -374,8 +396,22 @@ async fn negotiate_send(
         _ => anyhow::bail!("Expected KeyExchange"),
     };
 
+    // Check for optional delta sync hashes (non-blocking: receiver may not send them)
+    let receiver_block_hashes = match tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        conn.recv_msg(),
+    ).await {
+        Ok(Ok(ControlMessage::DeltaSyncHashes { block_hashes, .. })) => block_hashes,
+        _ => Vec::new(), // No delta sync or timeout — full transfer
+    };
+
     let data_addr = SocketAddr::new(server_addr.ip(), data_port);
-    Ok((shared_key, data_addr, session_id))
+    Ok(NegotiateResult {
+        shared_key,
+        data_addr,
+        session_id,
+        receiver_block_hashes,
+    })
 }
 
 async fn run_serve(bind: SocketAddr, output: PathBuf, rate_mbps: u64) -> Result<()> {
@@ -444,6 +480,27 @@ async fn run_serve(bind: SocketAddr, output: PathBuf, rate_mbps: u64) -> Result<
             public_key: shared_key.to_vec(),
         })
         .await?;
+
+        // Delta sync: check if file already exists on receiver
+        let existing_path = output.join(&filename);
+        if existing_path.exists() && existing_path.is_file() {
+            if let Ok(existing_meta) = tokio::fs::metadata(&existing_path).await {
+                if existing_meta.len() == file_size {
+                    // Same size — hash blocks and send delta info
+                    if let Ok(hashes) = updown::engine::delta::compute_block_hashes(
+                        &existing_path,
+                        block_size,
+                    ).await {
+                        println!("  Delta sync: hashing {} existing blocks", hashes.len());
+                        conn.send_msg(&ControlMessage::DeltaSyncHashes {
+                            session_id,
+                            file_index: 0,
+                            block_hashes: hashes,
+                        }).await.ok();
+                    }
+                }
+            }
+        }
 
         // Spawn the transfer in a background task (concurrent transfers)
         let output = output.clone();
