@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -378,23 +379,25 @@ async fn negotiate_send(
 }
 
 async fn run_serve(bind: SocketAddr, output: PathBuf, rate_mbps: u64) -> Result<()> {
+    use std::sync::atomic::{AtomicU16, Ordering};
+
     println!("=== updown server ===");
     println!("  Listening on:  {}", bind);
     println!("  Output dir:    {}", output.display());
     println!("  Target rate:   {} Mbps", rate_mbps);
     println!();
     println!("Waiting for incoming transfers...");
-    println!("  Sender runs: updown send <file> --to {}",  bind);
+    println!("  Sender runs: updown send <file> --to {}", bind);
     println!();
 
-    // QUIC control server on the bind port
     let control = ControlServer::bind(bind).await?;
 
+    // Atomic counter for dynamic data port allocation (concurrent transfers)
+    let port_counter = Arc::new(AtomicU16::new(bind.port() + 1));
+
     loop {
-        // Accept incoming QUIC connection from sender
         let mut conn = control.accept().await?;
 
-        // Receive transfer request
         let msg = conn.recv_msg().await?;
         let (session_id, filename, file_size, block_size, total_blocks, file_hash) = match msg {
             ControlMessage::TransferRequest {
@@ -424,65 +427,69 @@ async fn run_serve(bind: SocketAddr, output: PathBuf, rate_mbps: u64) -> Result<
             filename, file_size, total_blocks
         );
 
-        // Generate shared encryption key and send accept with key exchange
-        let shared_key: [u8; 32] = rand::random();
-
-        // Pick a UDP data port (use bind port + 1)
-        let data_port = bind.port() + 1;
+        // Allocate a unique data port for this transfer
+        let data_port = port_counter.fetch_add(1, Ordering::Relaxed);
         let data_addr = SocketAddr::new(bind.ip(), data_port);
 
-        // Send accept with key exchange
+        let shared_key: [u8; 32] = rand::random();
+
         conn.send_msg(&ControlMessage::TransferAccept {
             session_id,
             data_port,
         })
         .await?;
 
-        // Exchange encryption key (simplified: send key over the TLS-encrypted QUIC channel)
         conn.send_msg(&ControlMessage::KeyExchange {
             session_id,
             public_key: shared_key.to_vec(),
         })
         .await?;
 
-        // Start receiving
-        let engine = RecvEngine::new(output.clone())
-            .with_block_size(block_size)
-            .with_target_rate(rate_mbps);
+        // Spawn the transfer in a background task (concurrent transfers)
+        let output = output.clone();
+        tokio::spawn(async move {
+            let engine = RecvEngine::new(output)
+                .with_block_size(block_size)
+                .with_target_rate(rate_mbps);
 
-        let result = engine
-            .receive_file(
-                data_addr,
-                session_id,
-                &filename,
-                file_size,
-                total_blocks,
-                &shared_key,
-            )
-            .await?;
+            match engine
+                .receive_file(
+                    data_addr,
+                    session_id,
+                    &filename,
+                    file_size,
+                    total_blocks,
+                    &shared_key,
+                )
+                .await
+            {
+                Ok(result) => {
+                    conn.send_msg(&ControlMessage::TransferComplete {
+                        session_id,
+                        success: result.blake3_hash == file_hash,
+                        bytes_transferred: result.file_size,
+                        duration_ms: result.elapsed.as_millis() as u64,
+                    })
+                    .await
+                    .ok();
 
-        // Send completion
-        conn.send_msg(&ControlMessage::TransferComplete {
-            session_id,
-            success: result.blake3_hash == file_hash,
-            bytes_transferred: result.file_size,
-            duration_ms: result.elapsed.as_millis() as u64,
-        })
-        .await
-        .ok();
-
-        let hash_match = result.blake3_hash == file_hash;
-        println!("\n--- Receive Complete ---");
-        println!("  File:          {}", result.output_path.display());
-        println!("  Size:          {} bytes", result.file_size);
-        println!("  Rate:          {:.1} Mbps", result.rate_mbps);
-        println!("  Time:          {:.2?}", result.elapsed);
-        println!(
-            "  Integrity:     {}",
-            if hash_match { "PASS" } else { "FAIL" }
-        );
-        println!();
-        println!("Waiting for next transfer...");
+                    let hash_match = result.blake3_hash == file_hash;
+                    println!("\n--- Receive Complete ---");
+                    println!("  File:          {}", result.output_path.display());
+                    println!("  Size:          {} bytes", result.file_size);
+                    println!("  Rate:          {:.1} Mbps", result.rate_mbps);
+                    println!("  Time:          {:.2?}", result.elapsed);
+                    println!(
+                        "  Integrity:     {}",
+                        if hash_match { "PASS" } else { "FAIL" }
+                    );
+                    println!();
+                }
+                Err(e) => {
+                    eprintln!("Transfer failed: {}", e);
+                }
+            }
+        });
     }
 }
 
