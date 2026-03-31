@@ -180,20 +180,19 @@ async fn main() -> Result<()> {
         } => {
             let rate_mode = parse_rate_mode(&mode);
 
-            // Try QUIC auto-negotiation first
-            let negotiated = negotiate_send(&file, to, block_size).await;
-
-            let (shared_key, data_addr, session_id) = match negotiated {
-                Ok((key, addr, sid)) => {
-                    println!("Negotiated via QUIC control channel");
-                    (key, addr, sid)
-                }
-                Err(_) => {
-                    // Fall back to pre-shared key mode
-                    let key = parse_hex_key(&key)?;
-                    (key, to, rand::random())
-                }
+            // Collect files to send (single file or directory)
+            let files = if file.is_dir() {
+                updown::engine::multi::walk_directory(&file).await?
+            } else {
+                vec![updown::engine::multi::single_file_entry(&file).await?]
             };
+
+            let total_size: u64 = files.iter().map(|(_, e)| e.file_size).sum();
+            println!(
+                "Sending {} file(s), {} total",
+                files.len(),
+                updown::engine::multi::format_bytes(total_size)
+            );
 
             let engine = SendEngine::new(rate, rate_mode)
                 .with_block_size(block_size)
@@ -201,21 +200,46 @@ async fn main() -> Result<()> {
                 .with_interleave(interleave)
                 .with_compression(compress);
 
-            let result = engine
-                .send_file_with_session(&file, data_addr, &shared_key, session_id)
-                .await?;
+            let start = std::time::Instant::now();
+            let mut total_bytes_sent = 0u64;
+            let mut total_packets = 0u64;
 
+            for (i, (path, entry)) in files.iter().enumerate() {
+                println!(
+                    "[{}/{}] {} ({})",
+                    i + 1,
+                    files.len(),
+                    entry.relative_path,
+                    updown::engine::multi::format_bytes(entry.file_size)
+                );
+
+                // Negotiate each file via QUIC (or fall back to PSK)
+                let negotiated = negotiate_send(path, to, block_size).await;
+                let (shared_key, data_addr, session_id) = match negotiated {
+                    Ok((key, addr, sid)) => (key, addr, sid),
+                    Err(_) => {
+                        let key = parse_hex_key(&key)?;
+                        (key, to, rand::random())
+                    }
+                };
+
+                let result = engine
+                    .send_file_with_session(path, data_addr, &shared_key, session_id)
+                    .await?;
+
+                total_bytes_sent += result.total_bytes_sent;
+                total_packets += result.total_packets_sent;
+            }
+
+            let elapsed = start.elapsed();
+            let rate_mbps = (total_size as f64 * 8.0) / (elapsed.as_secs_f64() * 1_000_000.0);
             println!("\n--- Transfer Complete ---");
-            println!("  File size:     {} bytes", result.file_size);
-            println!("  Bytes sent:    {} bytes (with FEC)", result.total_bytes_sent);
-            println!("  Packets sent:  {}", result.total_packets_sent);
-            println!("  Time:          {:.2?}", result.elapsed);
-            println!("  Rate:          {:.1} Mbps", result.rate_mbps);
-            println!(
-                "  FEC overhead:  {:.1}%",
-                ((result.total_bytes_sent as f64 / result.file_size as f64) - 1.0) * 100.0
-            );
-            println!("  BLAKE3 hash:   {}", hex::encode(result.file_hash));
+            println!("  Files:         {}", files.len());
+            println!("  Total size:    {}", updown::engine::multi::format_bytes(total_size));
+            println!("  Bytes sent:    {}", updown::engine::multi::format_bytes(total_bytes_sent));
+            println!("  Packets:       {}", total_packets);
+            println!("  Time:          {:.2?}", elapsed);
+            println!("  Rate:          {:.1} Mbps", rate_mbps);
         }
 
         Commands::Recv {

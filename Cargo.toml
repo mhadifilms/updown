@@ -44,6 +44,9 @@ crossbeam-queue = "0.3"
 # Compression (level 1 for speed: ~338 MB/s, 3.7x ratio)
 zstd = "0.13"
 
+# Async recursion for directory walking
+async-recursion = "1"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

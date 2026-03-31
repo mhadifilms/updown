@@ -125,6 +125,34 @@ pub enum ControlMessage {
         session_id: u32,
         block_ids: Vec<u32>,
     },
+    /// Multi-file transfer: manifest of all files to transfer
+    MultiFileManifest {
+        session_id: u32,
+        files: Vec<FileEntry>,
+    },
+    /// Delta sync: receiver sends block hashes for an existing file
+    DeltaSyncHashes {
+        session_id: u32,
+        file_index: u32,
+        block_hashes: Vec<[u8; 32]>,
+    },
+    /// Delta sync: sender responds with which blocks need updating
+    DeltaSyncPlan {
+        session_id: u32,
+        file_index: u32,
+        blocks_to_send: Vec<u32>,
+    },
+}
+
+/// Entry in a multi-file manifest
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileEntry {
+    /// Relative path from the source root
+    pub relative_path: String,
+    /// File size in bytes
+    pub file_size: u64,
+    /// BLAKE3 hash of the file
+    pub blake3_hash: [u8; 32],
 }
 
 /// File metadata for a transfer session
