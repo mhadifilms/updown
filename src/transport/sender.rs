@@ -46,14 +46,9 @@ impl UdpSender {
             sock.bind(&addr.into())?;
 
             #[cfg(target_os = "linux")]
-            sock.connect(&target.into())?;
-
-            sock.set_send_buffer_size(8 * 1024 * 1024).ok();
-
-            // Try to enable GSO (Linux only)
-            #[cfg(target_os = "linux")]
             {
-                // UDP_SEGMENT socket option enables GSO
+                sock.connect(&target.into())?;
+                // Enable GSO: UDP_SEGMENT socket option (Linux 4.18+)
                 unsafe {
                     let segment_size: libc::c_int = 1400;
                     let ret = libc::setsockopt(
@@ -65,23 +60,23 @@ impl UdpSender {
                     );
                     if ret == 0 {
                         info!("GSO enabled (UDP_SEGMENT=1400)");
+                    } else {
+                        info!("GSO not available (kernel too old?)");
                     }
                 }
             }
 
+            sock.set_send_buffer_size(8 * 1024 * 1024).ok();
             sock
         };
 
         let socket = UdpSocket::from_std(std_socket.into())?;
 
-        // Detect if GSO is available
-        let gso_enabled = cfg!(target_os = "linux");
-
         info!(
-            "UDP sender bound to {}, target={}, gso={}",
+            "UDP sender bound to {}, target={}, platform={}",
             socket.local_addr()?,
             target,
-            gso_enabled,
+            std::env::consts::OS,
         );
 
         Ok(Self {
@@ -124,12 +119,11 @@ impl UdpSender {
 
         let encode_time = start.elapsed();
 
-        // Phase 2: Pre-build ALL wire-ready packets into a single contiguous buffer.
-        // One allocation instead of 90K. Packet index stores (offset, len) pairs.
+        // Phase 2: Build contiguous wire buffer with interleaved packet order
         let max_symbols = all_encoded.iter().map(|e| e.len()).max().unwrap_or(0);
         let estimated_pkt_size = 1500;
         let mut wire_buf: Vec<u8> = Vec::with_capacity(total_symbols * estimated_pkt_size);
-        let mut pkt_index: Vec<(usize, usize)> = Vec::with_capacity(total_symbols); // (offset, len)
+        let mut pkt_index: Vec<(usize, usize)> = Vec::with_capacity(total_symbols);
 
         for sym_idx in 0..max_symbols {
             for (blk_idx, encoded_block) in all_encoded.iter().enumerate() {
@@ -176,14 +170,7 @@ impl UdpSender {
             prep_time - encode_time,
         );
 
-        // Phase 3: Blast packets using try_send_to (non-blocking, no tokio overhead).
-        //
-        // Key insight: tokio's async send_to adds ~10μs per packet because it
-        // registers/deregisters with kqueue on every call. try_send_to is a direct
-        // non-blocking sendto() syscall — ~2-3μs. No .await = no scheduler overhead.
-        //
-        // On Linux with GSO: we'll concatenate packets into super-buffers and send
-        // with sendmsg + UDP_SEGMENT cmsg (1 syscall per 64 packets).
+        // Phase 3: Blast packets
         let target = self.target;
         let target_bps = self.rate_controller.current_rate_bps();
         let target_bytes_per_sec = (target_bps / 8).max(1);
@@ -191,27 +178,27 @@ impl UdpSender {
         let blast_start = Instant::now();
         let mut bytes_sent: u64 = 0;
         let mut packets_sent: u64 = 0;
-        let wouldblock_count: u64 = 0;
 
         #[cfg(target_os = "linux")]
         {
-            // Linux: use GSO super-buffers. Concatenate up to 64 uniform-size packets
-            // into one buffer, send with sendmsg + UDP_SEGMENT cmsg.
-            // This reduces syscalls by 64x.
+            // Linux GSO: concatenate up to 64 packets per sendmsg syscall.
+            // 64x fewer syscalls = the key to breaking 1 Gbps.
             let gso_batch = 64usize;
             let mut super_buf: Vec<u8> = Vec::with_capacity(gso_batch * 1500);
             let mut pkt_size = 0usize;
             let mut batch_count = 0usize;
+            let mut gso_sends = 0u64;
 
-            for (idx, &(offset, len)) in pkt_index.iter().enumerate() {
+            for &(offset, len) in pkt_index.iter() {
                 if batch_count == 0 {
-                    pkt_size = len; // First packet sets the segment size
+                    pkt_size = len;
                 }
 
-                // If this packet is a different size, flush the current batch
+                // GSO requires uniform segment sizes — flush if size changes
                 if len != pkt_size && batch_count > 0 {
                     bytes_sent += send_gso_batch(&self.socket, target, &super_buf, pkt_size)?;
                     packets_sent += batch_count as u64;
+                    gso_sends += 1;
                     super_buf.clear();
                     batch_count = 0;
                     pkt_size = len;
@@ -223,22 +210,41 @@ impl UdpSender {
                 if batch_count >= gso_batch {
                     bytes_sent += send_gso_batch(&self.socket, target, &super_buf, pkt_size)?;
                     packets_sent += batch_count as u64;
+                    gso_sends += 1;
                     super_buf.clear();
                     batch_count = 0;
+
+                    // Rate pacing per GSO batch (~64 packets)
+                    let elapsed = blast_start.elapsed();
+                    let expected_ns =
+                        (bytes_sent as u128 * 1_000_000_000) / target_bytes_per_sec as u128;
+                    let actual_ns = elapsed.as_nanos();
+                    if actual_ns < expected_ns {
+                        let sleep_ns = expected_ns - actual_ns;
+                        if sleep_ns > 10_000 {
+                            std::thread::sleep(Duration::from_nanos(sleep_ns as u64));
+                        }
+                    }
                 }
             }
 
-            // Flush remaining
             if batch_count > 0 {
                 bytes_sent += send_gso_batch(&self.socket, target, &super_buf, pkt_size)?;
                 packets_sent += batch_count as u64;
+                gso_sends += 1;
             }
+
+            info!(
+                "GSO blast: {} packets in {} sendmsg calls ({:.0}x reduction)",
+                packets_sent,
+                gso_sends,
+                if gso_sends > 0 { packets_sent as f64 / gso_sends as f64 } else { 0.0 }
+            );
         }
 
         #[cfg(not(target_os = "linux"))]
         {
-            // macOS/other: async send_to with coarse-grained pacing.
-            // Contiguous buffer avoids per-packet heap allocation.
+            // macOS/other: individual async send_to with coarse-grained pacing.
             let pace_check = 256usize;
 
             for (idx, &(offset, len)) in pkt_index.iter().enumerate() {
@@ -269,11 +275,6 @@ impl UdpSender {
                     }
                 }
             }
-        }
-
-        let _blast_time = blast_start.elapsed();
-        if wouldblock_count > 0 {
-            info!("Blast: {} WouldBlock retries (socket buffer pressure)", wouldblock_count);
         }
 
         let elapsed = start.elapsed();
@@ -373,8 +374,7 @@ pub struct InterlevedSendStats {
 }
 
 /// Send a GSO super-buffer on Linux.
-/// Concatenated packets in `buf` are segmented by the kernel at `segment_size` boundaries.
-/// One syscall sends up to 64 packets.
+/// One sendmsg() with UDP_SEGMENT cmsg sends up to 64 packets.
 #[cfg(target_os = "linux")]
 fn send_gso_batch(
     socket: &Arc<UdpSocket>,
@@ -396,7 +396,6 @@ fn send_gso_batch(
         _ => anyhow::bail!("IPv6 not yet supported for GSO"),
     };
 
-    // Set up cmsg for UDP_SEGMENT (GSO)
     let seg_size = segment_size as u16;
     let mut cmsg_buf = [0u8; 64];
     let cmsg_len = unsafe {
