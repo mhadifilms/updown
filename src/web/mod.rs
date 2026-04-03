@@ -64,12 +64,19 @@ pub async fn start_server(
         .allow_credentials(false);
 
     let app = Router::new()
-        // Web portal
+        // Web portal (SPA — all app routes serve the same HTML, client-side routing)
         .route("/", get(|| async { portal::portal_html() }))
-        // Share link download pages
+        .route("/send", get(|| async { portal::portal_html() }))
+        .route("/inbox", get(|| async { portal::portal_html() }))
+        .route("/sent", get(|| async { portal::portal_html() }))
+        .route("/links", get(|| async { portal::portal_html() }))
+        .route("/dropboxes", get(|| async { portal::portal_html() }))
+        .route("/history", get(|| async { portal::portal_html() }))
+        .route("/admin", get(|| async { portal::portal_html() }))
+        // Share link download page (separate clean UI)
         .route("/d/{code}", get(|| async { portal::download_page_html() }))
-        // Drop box (same as upload portal)
-        .route("/dropbox", get(|| async { portal::portal_html() }))
+        // Public drop box submission page (separate clean UI)
+        .route("/submit/{id}", get(|| async { portal::submit_page_html() }))
         // API routes
         .merge(api::api_router(state))
         // Locked-down CORS
