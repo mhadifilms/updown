@@ -136,6 +136,20 @@ enum Commands {
         #[arg(long, default_value = "4")]
         interleave: usize,
     },
+    /// Start the web portal + API server (Faspex replacement)
+    Server {
+        /// HTTP address to listen on
+        #[arg(short, long, default_value = "0.0.0.0:8080")]
+        bind: SocketAddr,
+
+        /// Directory to store uploaded files and database
+        #[arg(short, long, default_value = "./updown-data")]
+        storage: PathBuf,
+
+        /// UDP data port for fast transfers
+        #[arg(short, long, default_value = "9000")]
+        data_port: u16,
+    },
 }
 
 fn parse_hex_key(hex: &str) -> Result<[u8; 32]> {
@@ -311,6 +325,14 @@ async fn main() -> Result<()> {
             rate,
         } => {
             run_serve(bind, output, rate).await?;
+        }
+
+        Commands::Server {
+            bind,
+            storage,
+            data_port,
+        } => {
+            updown::web::start_server(bind, storage, data_port).await?;
         }
 
         Commands::Bench {
