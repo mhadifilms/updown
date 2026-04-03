@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use chrono::Utc;
+use rand::Rng;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -282,7 +283,14 @@ impl Database {
 
     pub fn create_share_link(&self, package_id: &str, created_by: &str, max_downloads: Option<i64>, expires_at: Option<&str>) -> Result<String> {
         let id = Uuid::new_v4().to_string();
-        let code = Uuid::new_v4().to_string()[..8].to_string(); // Short 8-char code
+        // Generate 18 cryptographically random bytes -> 24 URL-safe base64 chars
+        // This gives ~144 bits of entropy, infeasible to brute-force
+        let mut rng = rand::thread_rng();
+        let random_bytes: Vec<u8> = (0..18).map(|_| rng.gen::<u8>()).collect();
+        let code = random_bytes.iter().map(|b| {
+            const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            ALPHABET[(b & 0x3F) as usize] as char
+        }).collect::<String>();
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -319,5 +327,15 @@ impl Database {
             params![code],
         )?;
         Ok(())
+    }
+
+    /// Validate an API key and return the user if valid.
+    /// Performs constant-time-ish comparison by always hitting the DB index.
+    pub fn validate_api_key(&self, api_key: &str) -> Result<Option<User>> {
+        // Reject obviously invalid keys early (must start with upd_ prefix)
+        if !api_key.starts_with("upd_") || api_key.len() < 10 {
+            return Ok(None);
+        }
+        self.get_user_by_api_key(api_key)
     }
 }

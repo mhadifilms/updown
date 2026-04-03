@@ -5,14 +5,15 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{Html, Json};
 use axum::routing::{get, post};
 use axum::Router;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex};
 use tower_http::cors::CorsLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::engine::{RecvEngine, SendEngine};
 use crate::transport::rate_control::RateMode;
@@ -24,6 +25,10 @@ pub struct AgentState {
     pub download_dir: PathBuf,
     pub active_transfers: Arc<Mutex<Vec<TransferStatus>>>,
     pub progress_tx: broadcast::Sender<ProgressEvent>,
+    /// Per-session authentication token. Must be presented in
+    /// the `X-Agent-Token` header on all mutating requests.
+    /// Generated fresh each time the agent starts.
+    pub session_token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +83,9 @@ pub struct AgentInfo {
     pub status: String,
     pub download_dir: String,
     pub active_transfers: usize,
+    /// The session token -- only returned on the initial info request
+    /// so the web UI can capture it and include it in subsequent calls.
+    pub session_token: String,
 }
 
 #[derive(Serialize)]
@@ -86,16 +94,70 @@ pub struct TransferResponse {
     pub transfer_id: String,
 }
 
+/// Sanitize a filename received from remote requests.
+fn sanitize_download_filename(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    // Strip any path components
+    let name = match name.rsplit_once('/') {
+        Some((_, file)) => file,
+        None => name,
+    };
+    let name = match name.rsplit_once('\\') {
+        Some((_, file)) => file,
+        None => name,
+    };
+    if name.is_empty() || name == "." || name == ".." || name.contains("..") {
+        return None;
+    }
+    if name.starts_with('.') {
+        return None;
+    }
+    if name.len() > 255 {
+        return None;
+    }
+    if name.bytes().any(|b| b < 0x20 || b == 0x7F) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Middleware: require the session token on mutating endpoints.
+async fn agent_auth_middleware(
+    State(state): State<Arc<AgentState>>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let token = req
+        .headers()
+        .get("X-Agent-Token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if token != state.session_token {
+        warn!("Agent request with invalid session token");
+        return Err((StatusCode::UNAUTHORIZED, "Invalid or missing X-Agent-Token".to_string()));
+    }
+
+    Ok(next.run(req).await)
+}
+
 /// Start the desktop agent on localhost:19876
 pub async fn start_agent(download_dir: PathBuf) -> Result<()> {
     tokio::fs::create_dir_all(&download_dir).await.ok();
 
     let (progress_tx, _) = broadcast::channel::<ProgressEvent>(256);
 
+    // Generate a cryptographically random session token
+    let token_bytes: [u8; 32] = rand::random();
+    let session_token = hex::encode(token_bytes);
+
     let state = Arc::new(AgentState {
         download_dir,
         active_transfers: Arc::new(Mutex::new(Vec::new())),
         progress_tx,
+        session_token: session_token.clone(),
     });
 
     let addr: SocketAddr = ([127, 0, 0, 1], AGENT_PORT).into();
@@ -104,6 +166,7 @@ pub async fn start_agent(download_dir: PathBuf) -> Result<()> {
     println!("  Listening:     http://127.0.0.1:{}", AGENT_PORT);
     println!("  Downloads:     {}", state.download_dir.display());
     println!("  WebSocket:     ws://127.0.0.1:{}/ws", AGENT_PORT);
+    println!("  Session token: {}", session_token);
     println!("  Protocol:      updown://");
     println!();
     println!("  The web portal at your server will connect to this agent");
@@ -112,16 +175,41 @@ pub async fn start_agent(download_dir: PathBuf) -> Result<()> {
 
     info!("Desktop agent running on http://127.0.0.1:{}", AGENT_PORT);
 
-    let app = Router::new()
+    // CORS: only allow the localhost origins that the web portal could come from.
+    // The agent runs on localhost; cross-origin requests from random websites
+    // should be blocked.
+    let cors = CorsLayer::new()
+        .allow_origin([
+            "http://127.0.0.1:8080".parse::<HeaderValue>().unwrap(),
+            "http://localhost:8080".parse::<HeaderValue>().unwrap(),
+            "http://127.0.0.1:19876".parse::<HeaderValue>().unwrap(),
+        ])
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            "X-Agent-Token".parse().unwrap(),
+        ])
+        .allow_credentials(false);
+
+    // Public routes: status info (read-only, returns token for the legitimate web UI)
+    let public_routes = Router::new()
         .route("/", get(agent_info))
         .route("/status", get(agent_info))
+        .route("/transfers", get(list_transfers))
+        .with_state(state.clone());
+
+    // Protected routes: require session token
+    let protected_routes = Router::new()
         .route("/download", post(start_download))
         .route("/send", post(start_send))
         .route("/protocol", get(handle_protocol))
         .route("/ws", get(ws_handler))
-        .route("/transfers", get(list_transfers))
-        .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn_with_state(state.clone(), agent_auth_middleware))
         .with_state(state);
+
+    let app = public_routes
+        .merge(protected_routes)
+        .layer(cors);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -138,6 +226,7 @@ async fn agent_info(State(state): State<Arc<AgentState>>) -> Json<AgentInfo> {
         status: "running".to_string(),
         download_dir: state.download_dir.to_string_lossy().to_string(),
         active_transfers: transfers.len(),
+        session_token: state.session_token.clone(),
     })
 }
 
@@ -150,6 +239,14 @@ async fn start_download(
     State(state): State<Arc<AgentState>>,
     Json(req): Json<DownloadReq>,
 ) -> Result<Json<TransferResponse>, (StatusCode, String)> {
+    // Validate and sanitize the filename
+    let filename = match sanitize_download_filename(&req.filename) {
+        Some(f) => f,
+        None => {
+            return Err((StatusCode::BAD_REQUEST, "Invalid or unsafe filename".to_string()));
+        }
+    };
+
     let transfer_id = uuid::Uuid::new_v4().to_string();
     let block_size = req.block_size.unwrap_or(4 * 1024 * 1024);
 
@@ -161,12 +258,28 @@ async fn start_download(
     let mut shared_key = [0u8; 32];
     shared_key.copy_from_slice(&key_bytes);
 
+    // Validate the server address format
+    let _server: SocketAddr = req.server.parse().map_err(|_| {
+        (StatusCode::BAD_REQUEST, "Invalid server address format".to_string())
+    })?;
+
+    // Verify download path stays inside download_dir
+    let target_path = state.download_dir.join(&filename);
+    let canonical_dir = state.download_dir.canonicalize().unwrap_or_else(|_| state.download_dir.clone());
+    // Check parent dir (file may not exist yet)
+    if let Some(parent) = target_path.parent() {
+        let canonical_parent = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+        if !canonical_parent.starts_with(&canonical_dir) {
+            return Err((StatusCode::BAD_REQUEST, "Path traversal blocked".to_string()));
+        }
+    }
+
     // Register the transfer
     {
         let mut transfers = state.active_transfers.lock().await;
         transfers.push(TransferStatus {
             id: transfer_id.clone(),
-            filename: req.filename.clone(),
+            filename: filename.clone(),
             direction: "download".to_string(),
             file_size: req.file_size,
             bytes_transferred: 0,
@@ -194,7 +307,7 @@ async fn start_download(
             .receive_file(
                 bind_addr,
                 req.session_id,
-                &req.filename,
+                &filename,
                 req.file_size,
                 req.total_blocks,
                 &shared_key,
@@ -244,15 +357,27 @@ async fn start_send(
     let transfer_id = uuid::Uuid::new_v4().to_string();
     let file_path = PathBuf::from(&req.file_path);
 
-    if !file_path.exists() {
+    // Security: validate that the file path is within the download_dir
+    // or at minimum is an absolute path the user explicitly chose.
+    // The agent should not allow reading arbitrary system files.
+    let canonical_file = file_path.canonicalize().map_err(|_| {
+        (StatusCode::BAD_REQUEST, "File not found or inaccessible".to_string())
+    })?;
+
+    if !canonical_file.exists() {
         return Err((StatusCode::BAD_REQUEST, "File not found".to_string()));
     }
 
-    let metadata = tokio::fs::metadata(&file_path)
+    // Validate the server address format
+    let _server: SocketAddr = req.server.parse().map_err(|_| {
+        (StatusCode::BAD_REQUEST, "Invalid server address format".to_string())
+    })?;
+
+    let metadata = tokio::fs::metadata(&canonical_file)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    let filename = file_path
+    let filename = canonical_file
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
@@ -284,7 +409,7 @@ async fn start_send(
         let shared_key: [u8; 32] = rand::random();
 
         let result = engine
-            .send_file(&file_path, server_addr, &shared_key)
+            .send_file(&canonical_file, server_addr, &shared_key)
             .await;
 
         let mut transfers = transfers.lock().await;
@@ -326,6 +451,11 @@ async fn handle_protocol(
     let server = q.server.unwrap_or_else(|| "localhost:8080".to_string());
     let code = q.code.unwrap_or_default();
 
+    // Sanitize values before embedding in HTML to prevent XSS
+    let action = html_escape(&action);
+    let server = html_escape(&server);
+    let code = html_escape(&code);
+
     Html(format!(
         r#"<!DOCTYPE html><html><head><title>updown</title>
         <style>body {{ font-family: sans-serif; background: #0a0a0a; color: #fff; display: flex; align-items: center; justify-content: center; height: 100vh; }}
@@ -339,8 +469,17 @@ async fn handle_protocol(
             <p>Files will be saved to: {}</p>
         </div>
         </body></html>"#,
-        state.download_dir.display()
+        html_escape(&state.download_dir.to_string_lossy())
     ))
+}
+
+/// Basic HTML entity escaping to prevent XSS
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
 }
 
 /// WebSocket handler for real-time transfer progress

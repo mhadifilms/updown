@@ -8,15 +8,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
+use axum::http::{HeaderValue, Method};
 use axum::routing::get;
 use axum::Router;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
-use self::api::AppState;
+use self::api::{AppState, RateLimiter};
 use self::db::Database;
 
-/// Start the updown web server — the full Faspex replacement.
+/// Start the updown web server -- the full Faspex replacement.
 ///
 /// This serves:
 /// - Web portal at /
@@ -45,7 +46,22 @@ pub async fn start_server(
         storage_dir: storage_dir.clone(),
         data_port,
         host: bind.to_string(),
+        rate_limiter: tokio::sync::Mutex::new(RateLimiter::new()),
     });
+
+    // Restrictive CORS: only allow the server's own origin and the local agent
+    let cors = CorsLayer::new()
+        .allow_origin([
+            format!("http://{}", bind).parse::<HeaderValue>().unwrap_or_else(|_| HeaderValue::from_static("http://localhost:8080")),
+            "http://127.0.0.1:19876".parse::<HeaderValue>().unwrap(),
+            "http://localhost:19876".parse::<HeaderValue>().unwrap(),
+        ])
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+        ])
+        .allow_credentials(false);
 
     let app = Router::new()
         // Web portal
@@ -56,8 +72,8 @@ pub async fn start_server(
         .route("/dropbox", get(|| async { portal::portal_html() }))
         // API routes
         .merge(api::api_router(state))
-        // CORS for agent bridge
-        .layer(CorsLayer::permissive());
+        // Locked-down CORS
+        .layer(cors);
 
     info!("=== updown server ===");
     info!("Web portal:  http://{}", bind);
