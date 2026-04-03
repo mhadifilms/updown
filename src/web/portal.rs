@@ -9,8 +9,13 @@ use axum::response::Html;
 ///   /submit/:id → Public upload portal (drop box)
 ///   /d/:code   → Share link download page
 ///   /admin     → Admin panel
+///   /login     → Login page
 pub fn portal_html() -> Html<&'static str> {
     Html(APP_HTML)
+}
+
+pub fn login_page_html() -> Html<&'static str> {
+    Html(LOGIN_HTML)
 }
 
 pub fn download_page_html() -> Html<&'static str> {
@@ -287,6 +292,9 @@ tr:hover td { background: var(--surface); }
 <script>
 const API = '';
 const AGENT = 'http://127.0.0.1:19876';
+
+// Session check — redirect to login if not authenticated
+fetch('/api/me').then(r => { if (!r.ok) window.location = '/login'; });
 let selectedFiles = [];
 
 // Navigation
@@ -561,6 +569,60 @@ async function submitFiles() {
     document.getElementById('result').innerHTML = data.ok
         ? '<p style="color:#22c55e">Submitted successfully!</p>'
         : '<p style="color:#ef4444">Submission failed</p>';
+}
+</script>
+</body>
+</html>"##;
+
+const LOGIN_HTML: &str = r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>updown — Login</title>
+<style>
+:root { --bg: #09090b; --surface: #131316; --border: #27272a; --text: #e4e4e7; --text3: #71717a; --blue: #3b82f6; --red: #ef4444; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+.login-card { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 48px; max-width: 400px; width: 90%; }
+h1 { font-size: 28px; text-align: center; margin-bottom: 4px; }
+h1 span { color: var(--blue); }
+.subtitle { text-align: center; color: var(--text3); font-size: 14px; margin-bottom: 32px; }
+.form-group { margin-bottom: 16px; }
+.form-group label { display: block; font-size: 13px; color: var(--text3); margin-bottom: 6px; }
+.form-input { width: 100%; padding: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-size: 14px; }
+.form-input:focus { outline: none; border-color: var(--blue); }
+.btn { width: 100%; padding: 12px; border-radius: 8px; border: none; cursor: pointer; font-size: 15px; font-weight: 600; background: var(--blue); color: #fff; margin-top: 8px; }
+.btn:hover { background: #2563eb; }
+.error { color: var(--red); font-size: 13px; margin-top: 12px; text-align: center; display: none; }
+.help { margin-top: 20px; font-size: 12px; color: var(--text3); text-align: center; }
+.help code { background: var(--bg); padding: 2px 6px; border-radius: 4px; font-size: 11px; }
+</style>
+</head>
+<body>
+<div class="login-card">
+    <h1><span>up</span>down</h1>
+    <p class="subtitle">Sign in to your account</p>
+    <form onsubmit="doLogin(event)">
+        <div class="form-group">
+            <label>API Key</label>
+            <input type="password" class="form-input" id="api-key" placeholder="upd_..." autofocus>
+        </div>
+        <button type="submit" class="btn">Sign In</button>
+    </form>
+    <p class="error" id="error-msg"></p>
+    <p class="help">Your API key was shown when the server started.<br>Look for <code>api_key=upd_...</code> in the server logs.</p>
+</div>
+<script>
+fetch('/api/me').then(r => { if (r.ok) window.location = '/'; });
+async function doLogin(e) {
+    e.preventDefault();
+    const key = document.getElementById('api-key').value.trim();
+    if (!key) return;
+    const r = await fetch('/api/login', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({api_key:key}) });
+    const data = await r.json();
+    if (data.ok) { window.location = '/'; }
+    else { document.getElementById('error-msg').textContent = data.error||'Invalid API key'; document.getElementById('error-msg').style.display='block'; }
 }
 </script>
 </body>

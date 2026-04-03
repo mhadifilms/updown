@@ -49,13 +49,24 @@ pub async fn start_server(
         rate_limiter: tokio::sync::Mutex::new(RateLimiter::new()),
     });
 
-    // Restrictive CORS: only allow the server's own origin and the local agent
+    // CORS: allow server origin, agent, and optional UPDOWN_DOMAIN env var
+    let mut origins: Vec<HeaderValue> = vec![
+        format!("http://{}", bind).parse().unwrap_or_else(|_| HeaderValue::from_static("http://localhost:8080")),
+        "http://127.0.0.1:19876".parse().unwrap(),
+        "http://localhost:19876".parse().unwrap(),
+    ];
+    // Add production domain if configured
+    if let Ok(domain) = std::env::var("UPDOWN_DOMAIN") {
+        if let Ok(v) = format!("https://{}", domain).parse::<HeaderValue>() {
+            origins.push(v);
+        }
+        if let Ok(v) = format!("http://{}", domain).parse::<HeaderValue>() {
+            origins.push(v);
+        }
+        info!("CORS: allowing origin {}", domain);
+    }
     let cors = CorsLayer::new()
-        .allow_origin([
-            format!("http://{}", bind).parse::<HeaderValue>().unwrap_or_else(|_| HeaderValue::from_static("http://localhost:8080")),
-            "http://127.0.0.1:19876".parse::<HeaderValue>().unwrap(),
-            "http://localhost:19876".parse::<HeaderValue>().unwrap(),
-        ])
+        .allow_origin(origins)
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([
             axum::http::header::CONTENT_TYPE,
@@ -64,6 +75,8 @@ pub async fn start_server(
         .allow_credentials(false);
 
     let app = Router::new()
+        // Login page
+        .route("/login", get(|| async { portal::login_page_html() }))
         // Web portal (SPA — all app routes serve the same HTML, client-side routing)
         .route("/", get(|| async { portal::portal_html() }))
         .route("/send", get(|| async { portal::portal_html() }))

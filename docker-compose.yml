@@ -1,0 +1,32 @@
+services:
+  updown:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - updown-data:/data
+    environment:
+      - RUST_LOG=info
+      - UPDOWN_DOMAIN=${UPDOWN_DOMAIN:-localhost}
+    ports:
+      # UDP data channel — must be exposed directly (Caddy can't proxy UDP)
+      - "9000:9000/udp"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy-data:/data
+      - caddy-config:/config
+    environment:
+      - UPDOWN_DOMAIN=${UPDOWN_DOMAIN:-localhost}
+    ports:
+      - "80:80"     # HTTP (redirects to HTTPS)
+      - "443:443"   # HTTPS
+    depends_on:
+      - updown
+
+volumes:
+  updown-data:
+  caddy-data:
+  caddy-config:

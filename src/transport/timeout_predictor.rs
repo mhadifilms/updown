@@ -124,10 +124,10 @@ mod tests {
     fn test_late_detection() {
         let mut predictor = TimeoutPredictor::new(1000, 4 * 1024 * 1024);
 
-        // Simulate on-time arrivals
-        let start = Instant::now();
+        // Simulate on-time arrivals — use Instant::now() per call
+        // so elapsed() is always ~0 (well within the predicted window)
         for i in 0..5 {
-            predictor.record_arrival(i, start, 4 * 1024 * 1024);
+            predictor.record_arrival(i, Instant::now(), 4 * 1024 * 1024);
         }
         assert_eq!(predictor.on_time_blocks, 5);
 

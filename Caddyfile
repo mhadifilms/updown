@@ -1,0 +1,18 @@
+{$UPDOWN_DOMAIN:localhost} {
+    # Auto-HTTPS via Let's Encrypt (production)
+    # For localhost testing, Caddy serves self-signed certs
+
+    # Reverse proxy to updown web server
+    reverse_proxy updown:8080
+
+    # Security headers
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    }
+
+    # Gzip compression for web assets
+    encode gzip
+}

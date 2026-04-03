@@ -228,39 +228,163 @@ fn sanitize_filename(name: &str) -> Option<String> {
     Some(name.to_string())
 }
 
-/// API key authentication middleware.
-/// Extracts the Bearer token from the Authorization header and validates it.
+/// Authentication middleware.
+/// Accepts EITHER:
+///   1. Authorization: Bearer upd_xxx (API key)
+///   2. Cookie: session=upd_xxx (browser session)
+/// This allows both API clients and the web portal to use the same endpoints.
 async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     req: Request,
     next: Next,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    // Try Authorization header first
     let auth_header = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
 
-    let api_key = match auth_header {
-        Some(h) if h.starts_with("Bearer ") => &h[7..],
-        _ => {
-            warn!("API request without valid Authorization header");
+    let api_key = if let Some(h) = auth_header {
+        if h.starts_with("Bearer ") {
+            Some(h[7..].to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Fall back to session cookie
+    let api_key = api_key.or_else(|| {
+        req.headers()
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|cookies| {
+                cookies.split(';').find_map(|c| {
+                    let c = c.trim();
+                    if c.starts_with("session=") {
+                        Some(c[8..].to_string())
+                    } else {
+                        None
+                    }
+                })
+            })
+    });
+
+    let api_key = match api_key {
+        Some(k) => k,
+        None => {
             return Err(err_status(
                 StatusCode::UNAUTHORIZED,
-                "Missing or invalid Authorization header. Use: Authorization: Bearer upd_xxx",
+                "Not authenticated. Login at /login or use Authorization: Bearer upd_xxx",
             ));
         }
     };
 
-    match state.db.validate_api_key(api_key) {
+    match state.db.validate_api_key(&api_key) {
         Ok(Some(_user)) => Ok(next.run(req).await),
-        Ok(None) => {
-            warn!("Invalid API key attempted");
-            Err(err_status(StatusCode::UNAUTHORIZED, "Invalid API key"))
-        }
+        Ok(None) => Err(err_status(StatusCode::UNAUTHORIZED, "Invalid credentials")),
         Err(_) => Err(err_status(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Authentication error",
         )),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct LoginReq {
+    pub api_key: String,
+}
+
+#[derive(Serialize)]
+pub struct LoginResponse {
+    pub name: String,
+    pub role: String,
+}
+
+/// Login endpoint — validates API key and sets a session cookie.
+async fn login(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LoginReq>,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    match state.db.validate_api_key(&req.api_key) {
+        Ok(Some(user)) => {
+            let body = serde_json::to_string(&ApiResponse {
+                ok: true,
+                data: LoginResponse {
+                    name: user.name,
+                    role: user.role,
+                },
+            })
+            .unwrap();
+
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    header::SET_COOKIE,
+                    format!(
+                        "session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400",
+                        req.api_key
+                    ),
+                )
+                .body(axum::body::Body::from(body))
+                .unwrap();
+
+            Ok(response)
+        }
+        Ok(None) => Err(err_status(StatusCode::UNAUTHORIZED, "Invalid API key")),
+        Err(_) => Err(err_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Authentication error",
+        )),
+    }
+}
+
+/// Logout — clear the session cookie.
+async fn logout() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(
+            header::SET_COOKIE,
+            "session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
+        )
+        .body(axum::body::Body::from(r#"{"ok":true,"data":"logged out"}"#))
+        .unwrap()
+}
+
+/// Check current session — returns user info if logged in.
+async fn me(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+) -> Result<Json<ApiResponse<LoginResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    let api_key = req
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|c| {
+                let c = c.trim();
+                if c.starts_with("session=") {
+                    Some(c[8..].to_string())
+                } else {
+                    None
+                }
+            })
+        });
+
+    let api_key = match api_key {
+        Some(k) if !k.is_empty() => k,
+        _ => return Err(err_status(StatusCode::UNAUTHORIZED, "Not logged in")),
+    };
+
+    match state.db.validate_api_key(&api_key) {
+        Ok(Some(user)) => Ok(ok_json(LoginResponse {
+            name: user.name,
+            role: user.role,
+        })),
+        _ => Err(err_status(StatusCode::UNAUTHORIZED, "Invalid session")),
     }
 }
 
@@ -270,6 +394,9 @@ pub fn api_router(state: Arc<AppState>) -> Router {
     let public_routes = Router::new()
         .route("/api/health", get(health))
         .route("/api/share/{code}", get(get_share_info))
+        .route("/api/login", post(login))
+        .route("/api/logout", post(logout))
+        .route("/api/me", get(me))
         .with_state(state.clone());
 
     // Protected routes (require API key)
