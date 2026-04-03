@@ -47,6 +47,11 @@ zstd = "0.13"
 # Async recursion for directory walking
 async-recursion = "1"
 
+# S3-compatible storage (AWS S3, Cloudflare R2, MinIO)
+aws-sdk-s3 = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-credential-types = "1"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

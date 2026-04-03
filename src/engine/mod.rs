@@ -4,6 +4,7 @@ pub mod resume;
 pub mod multi;
 pub mod delta;
 pub mod stats;
+pub mod s3;
 
 pub use send::SendEngine;
 pub use recv::RecvEngine;

@@ -3,6 +3,7 @@ pub mod sender;
 pub mod receiver;
 pub mod control;
 pub mod timeout_predictor;
+pub mod stun;
 
 pub use rate_control::*;
 pub use sender::*;

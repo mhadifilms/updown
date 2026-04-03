@@ -74,6 +74,32 @@ impl SendEngine {
         shared_key: &[u8; 32],
         session_id: u32,
     ) -> Result<SendResult> {
+        self.send_file_inner(file_path, receiver_addr, shared_key, session_id, &[])
+            .await
+    }
+
+    /// Send only the blocks that differ from the receiver's copy.
+    /// `skip_blocks` contains block IDs that the receiver already has.
+    pub async fn send_file_delta(
+        &self,
+        file_path: &Path,
+        receiver_addr: SocketAddr,
+        shared_key: &[u8; 32],
+        session_id: u32,
+        skip_blocks: &[u32],
+    ) -> Result<SendResult> {
+        self.send_file_inner(file_path, receiver_addr, shared_key, session_id, skip_blocks)
+            .await
+    }
+
+    async fn send_file_inner(
+        &self,
+        file_path: &Path,
+        receiver_addr: SocketAddr,
+        shared_key: &[u8; 32],
+        session_id: u32,
+        skip_blocks: &[u32],
+    ) -> Result<SendResult> {
         let start = Instant::now();
 
         let metadata = tokio::fs::metadata(file_path).await?;
@@ -98,6 +124,19 @@ impl SendEngine {
             }
             hasher.finalize()
         };
+
+        let blocks_to_skip: std::collections::HashSet<u32> = skip_blocks.iter().copied().collect();
+        let blocks_to_send = total_blocks as usize - blocks_to_skip.len();
+
+        if !blocks_to_skip.is_empty() {
+            info!(
+                "Delta sync: sending {}/{} blocks ({} skipped, {:.0}% savings)",
+                blocks_to_send,
+                total_blocks,
+                blocks_to_skip.len(),
+                (blocks_to_skip.len() as f64 / total_blocks as f64) * 100.0,
+            );
+        }
 
         info!(
             "Sending {} ({} bytes, {} blocks, interleave={}, compress={})",
@@ -138,6 +177,7 @@ impl SendEngine {
         let interleave = self.interleave_depth;
         let compress = self.compress;
         let file_path_owned = file_path.to_path_buf();
+        let skip_set = blocks_to_skip.clone();
 
         // Spawn reader/encoder pipeline
         let reader_handle = tokio::spawn(async move {
@@ -159,7 +199,13 @@ impl SendEngine {
                     let remaining = (file_size - offset) as usize;
                     let this_block_size = remaining.min(block_size);
 
+                    // Always read to keep file offset correct
                     file.read_exact(&mut block_bufs[i][..this_block_size]).await?;
+
+                    // Skip blocks the receiver already has (delta sync)
+                    if skip_set.contains(&current_bid) {
+                        continue;
+                    }
 
                     let data = if compress {
                         let compressed =
@@ -176,8 +222,11 @@ impl SendEngine {
                     group.push((current_bid, data));
                 }
 
-                if group_tx.send(group).await.is_err() {
-                    break; // Receiver dropped
+                // Only send non-empty groups
+                if !group.is_empty() {
+                    if group_tx.send(group).await.is_err() {
+                        break;
+                    }
                 }
 
                 bid = group_end;

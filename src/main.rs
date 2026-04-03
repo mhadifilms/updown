@@ -216,21 +216,27 @@ async fn main() -> Result<()> {
 
                 // Negotiate each file via QUIC (or fall back to PSK)
                 let negotiated = negotiate_send(path, to, block_size).await;
-                let (shared_key, data_addr, session_id, _delta_hashes) = match negotiated {
+                let (shared_key, data_addr, session_id, skip_blocks) = match negotiated {
                     Ok(nr) => {
-                        if !nr.receiver_block_hashes.is_empty() {
-                            // Delta sync available — compute which blocks changed
+                        let skip = if !nr.receiver_block_hashes.is_empty() {
                             let source_hashes = updown::engine::delta::compute_block_hashes(path, block_size).await?;
                             let changed = updown::engine::delta::diff_block_hashes(&source_hashes, &nr.receiver_block_hashes);
                             let stats = updown::engine::delta::DeltaSyncStats::from_diff(
                                 source_hashes.len() as u32, &changed
                             );
+                            // Skip blocks that are UNCHANGED (send only changed ones)
+                            let unchanged: Vec<u32> = (0..source_hashes.len() as u32)
+                                .filter(|b| !changed.contains(b))
+                                .collect();
                             println!(
                                 "    Delta: {}/{} blocks changed ({:.0}% savings)",
                                 stats.changed_blocks, stats.total_blocks, stats.savings_percent
                             );
-                        }
-                        (nr.shared_key, nr.data_addr, nr.session_id, nr.receiver_block_hashes)
+                            unchanged
+                        } else {
+                            Vec::new()
+                        };
+                        (nr.shared_key, nr.data_addr, nr.session_id, skip)
                     }
                     Err(_) => {
                         let key = parse_hex_key(&key)?;
@@ -238,9 +244,15 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                let result = engine
-                    .send_file_with_session(path, data_addr, &shared_key, session_id)
-                    .await?;
+                let result = if skip_blocks.is_empty() {
+                    engine
+                        .send_file_with_session(path, data_addr, &shared_key, session_id)
+                        .await?
+                } else {
+                    engine
+                        .send_file_delta(path, data_addr, &shared_key, session_id, &skip_blocks)
+                        .await?
+                };
 
                 total_bytes_sent += result.total_bytes_sent;
                 total_packets += result.total_packets_sent;
