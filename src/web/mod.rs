@@ -1,6 +1,7 @@
 pub mod db;
 pub mod api;
 pub mod portal;
+pub mod agent;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

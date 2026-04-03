@@ -159,7 +159,41 @@ td { padding: 12px; border-bottom: 1px solid #1a1a1a; font-size: 14px; }
 
 <script>
 const API = '';
+const AGENT = 'http://127.0.0.1:19876';
 let currentSharePkg = '';
+let agentConnected = false;
+
+// Check if desktop agent is running
+async function checkAgent() {
+    try {
+        const r = await fetch(AGENT + '/status', { mode: 'cors', signal: AbortSignal.timeout(1000) });
+        const d = await r.json();
+        agentConnected = true;
+        document.getElementById('header-stats').innerHTML += ' &mdash; <span style="color:#34d399">Agent connected</span>';
+    } catch(e) {
+        agentConnected = false;
+        document.getElementById('header-stats').innerHTML += ' &mdash; <span style="color:#f87171">Agent not running</span> <a href="#" onclick="showAgentHelp()" style="color:#60a5fa;font-size:11px">Install</a>';
+    }
+}
+
+function showAgentHelp() {
+    alert('Run this in your terminal:\\n\\nupdown agent --register\\n\\nThis starts the desktop agent and registers the updown:// URL scheme.');
+}
+
+// Connect WebSocket to agent for real-time progress
+function connectAgentWS() {
+    if (!agentConnected) return;
+    try {
+        const ws = new WebSocket('ws://127.0.0.1:19876/ws');
+        ws.onmessage = (e) => {
+            const data = JSON.parse(e.data);
+            console.log('Agent progress:', data);
+        };
+        ws.onclose = () => setTimeout(connectAgentWS, 5000);
+    } catch(e) {}
+}
+setTimeout(checkAgent, 500);
+setTimeout(connectAgentWS, 1500);
 
 function showTab(name) {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));

@@ -136,6 +136,16 @@ enum Commands {
         #[arg(long, default_value = "4")]
         interleave: usize,
     },
+    /// Run the desktop agent (background service for fast transfers)
+    Agent {
+        /// Download directory
+        #[arg(short, long, default_value = "~/Downloads")]
+        download_dir: String,
+
+        /// Register updown:// URL scheme on macOS
+        #[arg(long)]
+        register: bool,
+    },
     /// Start the web portal + API server (Faspex replacement)
     Server {
         /// HTTP address to listen on
@@ -325,6 +335,24 @@ async fn main() -> Result<()> {
             rate,
         } => {
             run_serve(bind, output, rate).await?;
+        }
+
+        Commands::Agent {
+            download_dir,
+            register,
+        } => {
+            let dir = if download_dir.starts_with("~/") {
+                dirs_next::home_dir()
+                    .unwrap_or_default()
+                    .join(&download_dir[2..])
+            } else {
+                PathBuf::from(&download_dir)
+            };
+            if register {
+                updown::web::agent::register_url_scheme()?;
+                println!("Registered updown:// URL scheme");
+            }
+            updown::web::agent::start_agent(dir).await?;
         }
 
         Commands::Server {
