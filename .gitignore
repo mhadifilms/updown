@@ -1,1 +1,5 @@
 /target
+/updown-data
+*.db
+*.db-journal
+*.updown-resume

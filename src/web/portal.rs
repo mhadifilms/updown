@@ -27,6 +27,7 @@ const APP_HTML: &str = r##"<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>updown</title>
+<script src="https://unpkg.com/lucide@latest"></script>
 <style>
 :root { --bg: #09090b; --surface: #131316; --surface2: #1a1a1f; --border: #27272a; --text: #e4e4e7; --text2: #a1a1aa; --text3: #71717a; --blue: #3b82f6; --blue2: #2563eb; --green: #22c55e; --red: #ef4444; --radius: 10px; }
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -43,7 +44,9 @@ a { color: var(--blue); text-decoration: none; }
 .nav-item { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: 8px; color: var(--text2); font-size: 14px; cursor: pointer; transition: all 0.1s; }
 .nav-item:hover { background: var(--surface2); color: var(--text); }
 .nav-item.active { background: var(--blue); background: rgba(59,130,246,0.15); color: var(--blue); font-weight: 500; }
-.nav-item .icon { width: 18px; text-align: center; font-size: 15px; }
+.nav-item .icon { width: 18px; text-align: center; font-size: 15px; display: flex; align-items: center; justify-content: center; }
+.nav-item i[data-lucide], .btn i[data-lucide] { width: 16px; height: 16px; }
+.file-remove i[data-lucide] { width: 14px; height: 14px; }
 .nav-badge { margin-left: auto; background: var(--blue); color: #fff; font-size: 11px; padding: 1px 6px; border-radius: 10px; }
 .sidebar-footer { padding: 16px 20px; border-top: 1px solid var(--border); }
 .agent-status { font-size: 12px; display: flex; align-items: center; gap: 6px; }
@@ -134,35 +137,35 @@ tr:hover td { background: var(--surface); }
     <div class="sidebar-nav">
         <div class="nav-section">
             <div class="nav-item active" onclick="navigate('dashboard')">
-                <span class="icon">&#9632;</span> Dashboard
+                <span class="icon"><i data-lucide="layout-dashboard"></i></span> Dashboard
             </div>
         </div>
         <div class="nav-section">
             <div class="nav-section-label">Transfer</div>
             <div class="nav-item" onclick="navigate('send')">
-                <span class="icon">&#9650;</span> Send Files
+                <span class="icon"><i data-lucide="upload"></i></span> Send Files
             </div>
             <div class="nav-item" onclick="navigate('inbox')">
-                <span class="icon">&#9660;</span> Inbox
+                <span class="icon"><i data-lucide="inbox"></i></span> Inbox
                 <span class="nav-badge" id="inbox-count" style="display:none">0</span>
             </div>
             <div class="nav-item" onclick="navigate('sent')">
-                <span class="icon">&#10003;</span> Sent
+                <span class="icon"><i data-lucide="check-circle"></i></span> Sent
             </div>
         </div>
         <div class="nav-section">
             <div class="nav-section-label">Share</div>
             <div class="nav-item" onclick="navigate('links')">
-                <span class="icon">&#128279;</span> Share Links
+                <span class="icon"><i data-lucide="link"></i></span> Share Links
             </div>
             <div class="nav-item" onclick="navigate('dropboxes')">
-                <span class="icon">&#128230;</span> Drop Boxes
+                <span class="icon"><i data-lucide="archive"></i></span> Drop Boxes
             </div>
         </div>
         <div class="nav-section">
             <div class="nav-section-label">System</div>
             <div class="nav-item" onclick="navigate('history')">
-                <span class="icon">&#9776;</span> Transfer History
+                <span class="icon"><i data-lucide="history"></i></span> Transfer History
             </div>
         </div>
     </div>
@@ -192,7 +195,7 @@ tr:hover td { background: var(--surface); }
         <h2 style="font-size:16px;margin-bottom:12px">Recent Activity</h2>
         <div id="dashboard-activity"><div class="empty"><h3>No activity yet</h3><p>Send your first package to get started</p></div></div>
         <div style="margin-top:24px;text-align:center">
-            <button class="btn btn-primary" onclick="navigate('send')">&#9650; Send Files</button>
+            <button class="btn btn-primary" onclick="navigate('send')"><i data-lucide="send"></i> Send Files</button>
         </div>
     </div>
 
@@ -226,7 +229,7 @@ tr:hover td { background: var(--surface); }
             </div>
             <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
                 <button class="btn btn-ghost" onclick="navigate('dashboard')">Cancel</button>
-                <button class="btn btn-primary" onclick="sendPackage()">&#9650; Send Package</button>
+                <button class="btn btn-primary" onclick="sendPackage()"><i data-lucide="send"></i> Send Package</button>
             </div>
         </div>
     </div>
@@ -253,7 +256,7 @@ tr:hover td { background: var(--surface); }
     <div class="page" id="page-links">
         <div class="page-header" style="display:flex;justify-content:space-between;align-items:center">
             <div><h1>Share Links</h1><p>Manage your file sharing links</p></div>
-            <button class="btn btn-primary" onclick="navigate('send')">New Share Link</button>
+            <button class="btn btn-primary" onclick="navigate('send')"><i data-lucide="plus"></i> New Share Link</button>
         </div>
         <div id="links-list"><div class="empty"><h3>No share links</h3><p>Create a share link when sending a package</p></div></div>
     </div>
@@ -262,7 +265,7 @@ tr:hover td { background: var(--surface); }
     <div class="page" id="page-dropboxes">
         <div class="page-header" style="display:flex;justify-content:space-between;align-items:center">
             <div><h1>Drop Boxes</h1><p>Public upload portals for receiving files from anyone</p></div>
-            <button class="btn btn-primary" onclick="createDropbox()">Create Drop Box</button>
+            <button class="btn btn-primary" onclick="createDropbox()"><i data-lucide="plus"></i> Create Drop Box</button>
         </div>
         <div id="dropbox-list"><div class="empty"><h3>No drop boxes</h3><p>Create a drop box to let external users send you files</p></div></div>
     </div>
@@ -332,8 +335,9 @@ function renderFileList() {
     const el = document.getElementById('send-file-list');
     if (!selectedFiles.length) { el.innerHTML = ''; return; }
     el.innerHTML = selectedFiles.map((f, i) =>
-        '<div class="file-item"><span>' + f.name + '</span><span class="file-size">' + formatBytes(f.size) + '</span><span class="file-remove" onclick="removeFile(' + i + ')">&#10005;</span></div>'
+        '<div class="file-item"><span>' + f.name + '</span><span class="file-size">' + formatBytes(f.size) + '</span><span class="file-remove" onclick="removeFile(' + i + ')"><i data-lucide="x"></i></span></div>'
     ).join('');
+    lucide.createIcons();
 }
 
 // Send package
@@ -381,10 +385,11 @@ async function loadInbox() {
                     <h3>${p.name}</h3>
                     <div class="meta">${p.files.length} file(s) &middot; ${formatBytes(p.total_size)} &middot; ${p.created_at.slice(0,10)}</div>
                 </div>
-                <button class="btn btn-primary" onclick="downloadPackage('${p.id}')">&#9660; Download</button>
+                <button class="btn btn-primary" onclick="downloadPackage('${p.id}')"><i data-lucide="download"></i> Download</button>
             </div>
         </div>
     `).join('');
+    lucide.createIcons();
 }
 
 async function loadSent() {
@@ -443,6 +448,9 @@ function formatBytes(b) {
 fetch(API + '/api/health').then(r=>r.json()).then(d => {
     if (d.ok) document.getElementById('stat-sent').textContent = d.data.transfers_completed;
 });
+
+// Initialize Lucide icons
+document.addEventListener('DOMContentLoaded', () => { lucide.createIcons(); });
 </script>
 </body>
 </html>"##;
