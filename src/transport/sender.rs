@@ -147,7 +147,7 @@ impl UdpSender {
                 self.seq_num += 1;
 
                 let header_bytes = bincode::serialize(&header)?;
-                let aad = format!("{}-{}", block_id, symbol_id);
+                let aad = format!("{}-{}-{}", self.session_id, block_id, symbol_id);
                 let encrypted = self.crypto.encrypt(symbol_data, aad.as_bytes())?;
 
                 let pkt_start = wire_buf.len();

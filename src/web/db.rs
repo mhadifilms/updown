@@ -84,7 +84,7 @@ impl Database {
     }
 
     fn init_tables(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS transfers (
@@ -148,7 +148,7 @@ impl Database {
     pub fn create_transfer(&self, filename: &str, file_size: i64, direction: &str, peer: &str) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
         conn.execute(
             "INSERT INTO transfers (id, filename, file_size, direction, peer, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, filename, file_size, direction, peer, now],
@@ -157,7 +157,7 @@ impl Database {
     }
 
     pub fn complete_transfer(&self, id: &str, bytes: i64, packets: i64, rate: f64, duration_ms: i64, hash: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
         conn.execute(
             "UPDATE transfers SET status='completed', bytes_transferred=?2, packets=?3, rate_mbps=?4, duration_ms=?5, blake3_hash=?6 WHERE id=?1",
             params![id, bytes, packets, rate, duration_ms, hash],
@@ -166,7 +166,7 @@ impl Database {
     }
 
     pub fn list_transfers(&self, limit: i64) -> Result<Vec<Transfer>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
         let mut stmt = conn.prepare(
             "SELECT id, filename, file_size, bytes_transferred, packets, rate_mbps, duration_ms, blake3_hash, status, direction, peer, created_at FROM transfers ORDER BY created_at DESC LIMIT ?1"
         )?;
@@ -195,7 +195,7 @@ impl Database {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let files_json = serde_json::to_string(files)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
         conn.execute(
             "INSERT INTO packages (id, name, description, files, total_size, created_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![id, name, description, files_json, total_size, created_by, now],
@@ -204,7 +204,7 @@ impl Database {
     }
 
     pub fn get_package(&self, id: &str) -> Result<Option<Package>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
         let mut stmt = conn.prepare(
             "SELECT id, name, description, files, total_size, share_link, created_by, created_at, expires_at FROM packages WHERE id=?1"
         )?;
@@ -226,7 +226,7 @@ impl Database {
     }
 
     pub fn list_packages(&self, limit: i64) -> Result<Vec<Package>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
         let mut stmt = conn.prepare(
             "SELECT id, name, description, files, total_size, share_link, created_by, created_at, expires_at FROM packages ORDER BY created_at DESC LIMIT ?1"
         )?;
@@ -253,7 +253,7 @@ impl Database {
         let id = Uuid::new_v4().to_string();
         let api_key = format!("upd_{}", Uuid::new_v4().to_string().replace('-', ""));
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
         conn.execute(
             "INSERT INTO users (id, name, email, api_key, role, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, name, email, api_key, role, now],
@@ -262,7 +262,7 @@ impl Database {
     }
 
     pub fn get_user_by_api_key(&self, api_key: &str) -> Result<Option<User>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
         let mut stmt = conn.prepare(
             "SELECT id, name, email, api_key, role, created_at FROM users WHERE api_key=?1"
         )?;
@@ -292,7 +292,7 @@ impl Database {
             ALPHABET[(b & 0x3F) as usize] as char
         }).collect::<String>();
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
         conn.execute(
             "INSERT INTO share_links (id, code, package_id, created_by, max_downloads, expires_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![id, code, package_id, created_by, max_downloads, expires_at, now],
@@ -301,7 +301,7 @@ impl Database {
     }
 
     pub fn get_share_link(&self, code: &str) -> Result<Option<ShareLink>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
         let mut stmt = conn.prepare(
             "SELECT id, code, package_id, created_by, download_count, max_downloads, expires_at, created_at FROM share_links WHERE code=?1"
         )?;
@@ -321,7 +321,7 @@ impl Database {
     }
 
     pub fn increment_download_count(&self, code: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
         conn.execute(
             "UPDATE share_links SET download_count = download_count + 1 WHERE code=?1",
             params![code],

@@ -239,7 +239,7 @@ impl UdpReceiver {
             PacketType::Data => {
                 let encrypted_payload = &data[2 + header_len..];
 
-                let aad = format!("{}-{}", header.block_id, header.symbol_id);
+                let aad = format!("{}-{}-{}", header.session_id, header.block_id, header.symbol_id);
                 let decrypted = self.crypto.decrypt(encrypted_payload, aad.as_bytes())?;
 
                 let encoding_packet = EncodingPacket::deserialize(&decrypted);
