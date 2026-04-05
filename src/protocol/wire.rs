@@ -12,9 +12,9 @@ pub const MAX_PACKET_DATA: usize = MAX_UDP_PAYLOAD - PACKET_HEADER_SIZE - 28; //
 /// Default block size for file chunking (4 MiB)
 pub const DEFAULT_BLOCK_SIZE: usize = 4 * 1024 * 1024;
 
-/// Default symbol size for RaptorQ encoding
-/// Chosen to fit well in UDP packets after header + encryption
-pub const SYMBOL_SIZE: u16 = 1280;
+/// Default symbol size for RaptorQ encoding.
+/// Kept conservative for VPN/NAT paths to avoid UDP fragmentation drops.
+pub const SYMBOL_SIZE: u16 = 900;
 
 /// Magic bytes for packet identification
 pub const MAGIC: [u8; 4] = [0x55, 0x50, 0x44, 0x4E]; // "UPDN"

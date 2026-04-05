@@ -182,6 +182,10 @@ fn parse_rate_mode(mode: &str) -> RateMode {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // rustls 0.23 requires selecting a process-wide crypto provider explicitly.
+    // Ignore the error if another provider was already installed by this process.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
